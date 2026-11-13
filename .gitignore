@@ -1,0 +1,19 @@
+# Сборка (exe и установщик собираются build.ps1)
+build/
+dist/
+build_widget.py
+*.spec
+
+# Генерируются при сборке из make_icon.py
+app.ico
+app.png
+
+# Python
+__pycache__/
+*.pyc
+
+# Редакторы и система
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
