@@ -280,6 +280,69 @@ class TestStateChange(Base):
         self.assertEqual(app.state_menu.entrycget(0, "label"), "Нет доступных переходов")
 
 
+class TestFieldMenus(Base):
+    """Левый клик по плашке статуса / приоритета / спринта открывает список значений из YouTrack."""
+
+    def setUp(self):
+        super().setUp()
+        self._popup = w.tk.Menu.tk_popup
+        w.tk.Menu.tk_popup = lambda *a, **k: None  # меню не показываем (оно модальное), а проверяем его пункты
+        self.addCleanup(setattr, w.tk.Menu, "tk_popup", self._popup)
+
+    def labels(self, app):
+        m = app.field_menu
+        return [m.entrycget(i, "label") for i in range(m.index("end") + 1)]
+
+    def pick(self, app, text):
+        m = app.field_menu
+        idx = next(i for i in range(m.index("end") + 1) if m.entrycget(i, "label").strip().startswith(text))
+        m.invoke(idx)
+
+    def test_status_priority_sprint(self):
+        app = self.make_app()
+        # статус OE-1 (Открыта): только разрешённые переходы
+        self.click(app, "a0")
+        self.assertEqual([l.strip() for l in self.labels(app)],
+                         ["Сейчас: Открыта — перевести в:", "Ждет БА", "Проработка БА", "Отклонена"])
+        self.pick(app, "Ждет БА")
+        wait_for(app, lambda: self.card(app, "OE-1")["state"] == "Ждет БА", what="новый статус")
+        self.assertIn("статус → Ждет БА", app.status_lbl.cget("text"))
+        # приоритет OE-1: все значения, текущий отмечен и недоступен
+        self.click(app, "p0")
+        labels = self.labels(app)
+        self.assertIn("✓ Критический", labels)
+        self.assertEqual(app.field_menu.entrycget(labels.index("✓ Критический"), "state"), "disabled")
+        self.pick(app, "Высокий")
+        wait_for(app, lambda: self.card(app, "OE-1")["prio"] == "Высокий", what="новый приоритет")
+        # спринт у задачи без спринта (OE-4): на карточке «выбрать ▾», в списке — активные спринты
+        idx = self.ids(app).index("OE-4")
+        self.assertIn("выбрать", self.texts(app, f"r{idx}"))
+        self.click(app, f"r{idx}")
+        self.assertEqual([l.strip() for l in self.labels(app)],
+                         ["Спринт (не задан):", "26.22", "тестовый спринт 24"], "архивный 26.20 не предлагается")
+        self.pick(app, "26.22")
+        wait_for(app, lambda: self.card(app, "OE-4")["sprints"] == [("26.22", True)], what="спринт назначен")
+        # перенос в другой спринт и удаление из спринта
+        idx = self.ids(app).index("OE-4")
+        self.click(app, f"r{idx}")
+        self.pick(app, "тестовый спринт 24")
+        wait_for(app, lambda: [n for n, _ in self.card(app, "OE-4")["sprints"]] == ["тестовый спринт 24"],
+                 what="перенос в другой спринт")
+        idx = self.ids(app).index("OE-4")
+        self.click(app, f"r{idx}")
+        self.pick(app, "✓ тестовый спринт 24")
+        wait_for(app, lambda: self.card(app, "OE-4")["sprints"] == [], what="убрано из спринта")
+        self.assertEqual([c["query"] for c in mock.State.commands][-3:],
+                         ["add Спринт 26.22", "remove Спринт 26.22 add Спринт тестовый спринт 24",
+                          "remove Спринт тестовый спринт 24"])
+
+    def test_error_shown_in_menu(self):
+        app = self.make_app()
+        mock.control(self.base, "/test/mode?m=500")
+        self.click(app, "p0")
+        self.assertIn("HTTP 500", self.labels(app)[0])
+
+
 class TestNotifications(Base):
     def refresh(self, app):
         app.refresh()

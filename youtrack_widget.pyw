@@ -253,22 +253,57 @@ def _post(base_url: str, token: str, path: str, params: dict, body: dict):
         raise YTError(f"Нет соединения: {e.reason}")
 
 
-def fetch_state_options(base_url: str, token: str, issue: dict, state_field: str):
-    """Варианты смены статуса для конкретной задачи: [(подпись, команда)].
-    Для поля-«машины состояний» — только разрешённые переходы (события), иначе — все значения."""
-    f = _find_field(issue, state_field, "state")
+def _field_names(f):
+    v = f.get("value")
+    vals = v if isinstance(v, list) else [v] if v else []
+    return [x.get("name") for x in vals if isinstance(x, dict) and x.get("name")]
+
+
+def fetch_field_options(base_url: str, token: str, issue: dict, field_name: str, kind: str):
+    """Варианты для выпадающего списка поля задачи: {"field", "current", "options": [(подпись, команда, выбрано)]}.
+    kind: "state" — разрешённые переходы workflow (или все значения обычного поля), "priority" — значения,
+    "sprint" — активные спринты (выбор переносит задачу; клик по текущему — убирает из спринта).
+    Команды YouTrack пишутся БЕЗ фигурных скобок: «Приоритет Высокий», «remove Спринт 26.20 add Спринт 26.22»."""
+    f = sprint_field_of(issue, field_name) if kind == "sprint" else _find_field(issue, field_name, kind)
     if not f or not f.get("id") or not issue.get("id"):
-        raise YTError("Не найдено поле статуса")
-    name = f.get("name")
+        raise YTError({"state": "Не найдено поле статуса", "priority": "Не найдено поле приоритета",
+                       "sprint": "Не найдено поле спринта"}.get(kind, "Поле не найдено"))
+    name, current = f.get("name"), _field_names(f)
     data = _get(base_url, token, f"/api/issues/{issue['id']}/customFields/{f['id']}",
-                {"fields": "possibleEvents(id,presentation),projectCustomField(bundle(values(name,archived)))"})
-    current = (f.get("value") or {}).get("name") if isinstance(f.get("value"), dict) else None
-    events = data.get("possibleEvents") or []
-    if events or f.get("$type") == "StateMachineIssueCustomField":
-        return [(e.get("presentation") or e.get("id"), f"{name} {e['id']}") for e in events if e.get("id")]
+                {"fields": "possibleEvents(id,presentation),"
+                           "projectCustomField(bundle(values(name,archived,released,releaseDate)))"})
     values = (((data.get("projectCustomField") or {}).get("bundle") or {}).get("values")) or []
-    return [(v["name"], f"{name} {{{v['name']}}}") for v in values
-            if v.get("name") and not v.get("archived") and v.get("name") != current]
+    res = {"field": name, "current": current, "options": []}
+    if kind == "state":
+        events = data.get("possibleEvents") or []
+        if events or f.get("$type") == "StateMachineIssueCustomField":
+            res["options"] = [(e.get("presentation") or e["id"], f"{name} {e['id']}", False)
+                              for e in events if e.get("id")]
+        else:
+            res["options"] = [(v["name"], f"{name} {v['name']}", False) for v in values
+                              if v.get("name") and not v.get("archived") and v["name"] not in current]
+    elif kind == "priority":
+        res["options"] = [(v["name"], f"{name} {v['name']}", v["name"] in current) for v in values
+                          if v.get("name") and (not v.get("archived") or v["name"] in current)]
+    elif kind == "sprint":
+        now = time.time() * 1000
+        active = [v for v in values if v.get("name") and not v.get("archived") and not v.get("released")
+                  and (v.get("releaseDate") or now) >= now]
+        active.sort(key=lambda v: v.get("releaseDate") or 0)
+        names = [n for n in current] + [v["name"] for v in active if v["name"] not in current]
+        drop = " ".join(f"remove {name} {c}" for c in current)
+        for n in names:
+            if n in current:  # клик по текущему спринту — убрать задачу из него
+                res["options"].append((n, f"remove {name} {n}", True))
+            else:             # выбор другого спринта — перенос (убрать из текущих, добавить в выбранный)
+                res["options"].append((n, f"{drop} add {name} {n}".strip(), False))
+    return res
+
+
+def fetch_state_options(base_url: str, token: str, issue: dict, state_field: str):
+    """Варианты смены статуса: [(подпись, команда)] — только разрешённые переходы workflow."""
+    return [(label, cmd) for label, cmd, _ in
+            fetch_field_options(base_url, token, issue, state_field, "state")["options"]]
 
 
 def apply_command(base_url: str, token: str, issue: dict, command: str):
@@ -354,8 +389,8 @@ def live_comments(issue: dict):
 
 
 # ---------------------------------------------------------------- спринт
-def sprints_of(issue: dict, sprint_field: str):
-    """Спринты задачи: [(название, активный?)]. Поле ищется по имени из настроек или по смыслу
+def sprint_field_of(issue: dict, sprint_field: str):
+    """Поле спринта задачи: по имени из настроек или по смыслу
     (поле-версия со словом «спринт»/«sprint» — с ним синхронизируются Agile-доски)."""
     cfs = issue.get("customFields") or []
     f = None
@@ -364,6 +399,12 @@ def sprints_of(issue: dict, sprint_field: str):
     if f is None:
         f = next((x for x in cfs if "Version" in (x.get("$type") or "")
                   and any(h in (x.get("name") or "").lower() for h in ("спринт", "sprint"))), None)
+    return f
+
+
+def sprints_of(issue: dict, sprint_field: str):
+    """Спринты задачи: [(название, активный?)]."""
+    f = sprint_field_of(issue, sprint_field)
     v = f.get("value") if f else None
     if not v:
         return []
@@ -1206,6 +1247,8 @@ class Widget(tk.Tk):
         self.f_small_bold = tkfont.Font(self, family=FONT, size=small, weight="bold")
         self.f_link = tkfont.Font(self, family=FONT, size=small, underline=True)
         self.f_check = tkfont.Font(self, family=ICON_FAMILY if ICON_OK else FONT, size=FS + 6 if ICON_OK else FS + 2)
+        self.f_arrow = tkfont.Font(self, family=ICON_FAMILY if ICON_OK else FONT, size=max(10, FS) if ICON_OK
+                                   else max(7, FS - 4))
         self.f_handle = tkfont.Font(self, family=ICON_FAMILY if ICON_OK else FONT, size=FS + 4 if ICON_OK else FS)
         self.line_small = self.f_small.metrics("linespace")
         self.line_chip = self.f_chip.metrics("linespace")
@@ -1666,7 +1709,10 @@ class Widget(tk.Tk):
                     if added:
                         save_seen(self.seen)
                     self.last_ok = time.strftime("%H:%M")
-                    self.status_lbl.configure(text=f"Обновлено в {self.last_ok}", fg=BG_SUB)
+                    note = getattr(self, "_status_note", None)
+                    fresh = note and time.time() - note[1] < 10  # подтверждение недавнего изменения ещё видно
+                    self.status_lbl.configure(text=(f"{note[0]} · " if fresh else "") + f"Обновлено в {self.last_ok}",
+                                              fg=BG_SUB)
                     # автообновление раз в N минут: если в YouTrack ничего не поменялось — не перерисовываем
                     sig = hash(json.dumps(payload, sort_keys=True, ensure_ascii=False))
                     if sig != self._data_sig or not self.cards:
@@ -1872,6 +1918,7 @@ class Widget(tk.Tk):
                 "due": due,
                 "done": tab == "day" and issue.get("idReadable") in self.plan_done,
                 "sprints": sprints_of(issue, self.cfg.get("sprint_field", "")),
+                "has_sprint": sprint_field_of(issue, self.cfg.get("sprint_field", "")) is not None,
                 "bar": chip_colors(prio, prio_color)[0] if prio else "#3a3a3a",
                 "hay": f"{issue.get('idReadable', '')} {summary} {state or ''} {prio or ''} "
                        f"{due[0] if due else ''} "
@@ -2010,23 +2057,41 @@ class Widget(tk.Tk):
                               font=self.f_title_done if card["done"] else self.f_title, anchor="nw",
                               width=wrap, tags=(t, f"t{i}"))
         cy = c.bbox(title)[3] + 6
-        rows = [("Статус", card["state"], card["state_colors"]),
-                ("Приоритет", card["prio"], card["prio_colors"])]
+        # (подпись, значение, цвета, роль): роль a/p/r — плашка кликабельна и открывает список значений из YouTrack
+        rows = [("Статус", card["state"], card["state_colors"], "a"),
+                ("Приоритет", card["prio"], card["prio_colors"], "p")]
         if card["due"]:  # строка «Срок» — только если срок задан
             dtext, dbg, dfg, _ = card["due"]
-            rows.append(("Срок", dtext, (dbg, dfg) if dbg else chip_colors(dtext, None)))
+            rows.append(("Срок", dtext, (dbg, dfg) if dbg else chip_colors(dtext, None), None))
         if card["sprints"]:  # строка «Спринт»: текущий спринт синим, прошедшие — серым
             name, active = card["sprints"][0]
             more = f" +{len(card['sprints']) - 1}" if len(card["sprints"]) > 1 else ""
-            rows.append(("Спринт", name + more, ("#1565c0", "#ffffff") if active else chip_colors(name, None)))
-        for caption, value, colors in rows:
+            rows.append(("Спринт", name + more, ("#1565c0", "#ffffff") if active else chip_colors(name, None), "r"))
+        elif card.get("has_sprint"):  # спринта нет, но поле есть — можно назначить
+            rows.append(("Спринт", None, None, "r"))
+        arrow = ic("arrow_drop_down") if ICON_OK else "▾"
+        for caption, value, colors, role in rows:
             c.create_text(tx, cy + 1, text=caption, fill=SUB, font=self.f_small, anchor="nw", tags=(t,))
             vx = tx + self.cap_w + 10
+            tags = (t, f"{role}{i}") if role else (t,)
             if value:
                 cbg, cfg = colors
                 tw = self.f_chip.measure(value)
-                c.create_rectangle(vx, cy, vx + tw + 10, cy + self.line_chip + 2, fill=cbg, outline="", tags=(t,))
-                c.create_text(vx + 5, cy + 1, text=value, fill=cfg, font=self.f_chip, anchor="nw", tags=(t,))
+                aw = self.f_arrow.measure(arrow) if role else 0  # стрелка ▾ — подсказка, что это выпадающий список
+                c.create_rectangle(vx, cy, vx + tw + 10 + aw, cy + self.line_chip + 2, fill=cbg, outline="",
+                                   tags=tags)
+                c.create_text(vx + 5, cy + 1, text=value, fill=cfg, font=self.f_chip, anchor="nw", tags=tags)
+                if role:
+                    c.create_text(vx + 5 + tw + aw / 2 + 1, cy + (self.line_chip + 2) / 2, text=arrow, fill=cfg,
+                                  font=self.f_arrow, tags=tags)
+            elif role:  # пусто, но можно выбрать: «— ▾» в рамке
+                tw = self.f_small.measure("выбрать")
+                aw = self.f_arrow.measure(arrow)
+                c.create_rectangle(vx, cy, vx + tw + 10 + aw, cy + self.line_chip + 2, fill="",
+                                   outline=SUB, dash=(2, 2), tags=tags)
+                c.create_text(vx + 5, cy + 1, text="выбрать", fill=SUB, font=self.f_small, anchor="nw", tags=tags)
+                c.create_text(vx + 5 + tw + aw / 2 + 1, cy + (self.line_chip + 2) / 2, text=arrow, fill=SUB,
+                              font=self.f_arrow, tags=tags)
             else:
                 c.create_text(vx, cy + 1, text="—", fill=SUB, font=self.f_small, anchor="nw", tags=(t,))
             cy += self.line_chip + 5
@@ -2118,7 +2183,7 @@ class Widget(tk.Tk):
                 if num.isdigit():
                     if head == "c" and card is None:
                         card = int(num)
-                    elif head in "tisokhex" and role is None:
+                    elif head in "tisokhexapr" and role is None:
                         role = head
             if card is not None:
                 break
@@ -2240,6 +2305,8 @@ class Widget(tk.Tk):
             self.toggle_plan(issue)
         elif role == "k":
             self.toggle_done(issue)
+        elif role in self.FIELD_MENUS:  # клик по плашке статуса / приоритета / спринта
+            self.open_field_menu(card, role)
 
     # ----- быстрый просмотр
     def toggle_details(self, issue):
@@ -2478,30 +2545,83 @@ class Widget(tk.Tk):
                 m.add_command(label=label, command=lambda l=label, c=cmd, iss=issue: self.change_state(iss, l, c))
 
     def change_state(self, issue, label, command):
+        self.change_field(issue, "статус", label, command)
+
+    def change_field(self, issue, what, label, command):
+        """Применить команду YouTrack (смена статуса/приоритета/спринта) в фоне и перечитать задачи."""
         iid = issue.get("idReadable")
-        self.status_lbl.configure(text=f"{iid}: меняю статус на «{label}»…", fg=BG_SUB)
+        self.status_lbl.configure(text=f"{iid}: меняю {what} на «{label}»…", fg=BG_SUB)
         token, base = unprotect(self.cfg["token_enc"]), self.cfg["base_url"]
 
         def work():
             try:
                 apply_command(base, token, issue, command)
-                self.q.put((self._state_changed, (iid, label, None)))
+                err = None
             except YTError as ex:
-                self.q.put((self._state_changed, (iid, label, str(ex))))
+                err = str(ex)
             except Exception as ex:  # noqa
-                self.q.put((self._state_changed, (iid, label, f"Ошибка: {ex}")))
+                err = f"Ошибка: {ex}"
+            self.q.put((self._state_changed, (iid, what, label, err)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _state_changed(self, res):
-        iid, label, err = res
+        iid, what, label, err = res
         self._state_cache.pop(iid, None)
         if err:
-            self.status_lbl.configure(text=f"{iid}: статус не изменён", fg=ERR)
-            messagebox.showerror("Смена статуса", f"{iid}: не удалось перевести в «{label}».\n\n{err}", parent=self)
+            self.status_lbl.configure(text=f"{iid}: {what} не изменён", fg=ERR)
+            messagebox.showerror(f"Смена: {what}", f"{iid}: не удалось изменить {what} на «{label}».\n\n{err}",
+                                 parent=self)
             return
-        self.status_lbl.configure(text=f"{iid}: статус → {label}", fg=BG_SUB)
+        self._status_note = (f"✓ {iid}: {what} → {label}", time.time())  # не затирать сразу после обновления
+        self.status_lbl.configure(text=self._status_note[0], fg=BG_SUB)
         self.refresh()  # перечитать задачи (задача могла уйти из списка, если статус её закрывает)
+
+    # ----- выпадающие списки на плашках карточки (левый клик по статусу / приоритету / спринту)
+    FIELD_MENUS = {"a": ("state", "статус"), "p": ("priority", "приоритет"), "r": ("sprint", "спринт")}
+
+    def open_field_menu(self, card_index, role):
+        kind, what = self.FIELD_MENUS[role]
+        issue = self.visible[card_index]["issue"]
+        field_name = {"state": self.cfg["state_field"], "priority": self.cfg["priority_field"],
+                      "sprint": self.cfg.get("sprint_field", "")}[kind]
+        c = self.canvas
+        box = c.bbox(f"{role}{card_index}")
+        x = c.winfo_rootx() + int(box[0] - c.canvasx(0))
+        y = c.winfo_rooty() + int(box[3] - c.canvasy(0)) + 2
+        self.configure(cursor="watch")
+        c.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            data = fetch_field_options(self.cfg["base_url"], unprotect(self.cfg["token_enc"]), issue, field_name, kind)
+        except YTError as ex:
+            data = ex
+        finally:
+            self.configure(cursor="")
+            c.configure(cursor="")
+        m = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT, activebackground=CARD_HOVER, activeforeground=TEXT, bd=0,
+                    font=(FONT, max(9, FS - 2)))
+        self.field_menu = m  # для автотестов
+        if isinstance(data, Exception):
+            m.add_command(label=str(data)[:80], state="disabled")
+        else:
+            cur = ", ".join(data["current"]) or "не задан"
+            head = {"state": f"Сейчас: {cur} — перевести в:", "priority": "Приоритет:",
+                    "sprint": f"Спринт ({cur}):"}[kind]
+            m.add_command(label=head, state="disabled")
+            if not data["options"]:
+                m.add_command(label="Нет доступных переходов" if kind == "state" else "Нет доступных значений",
+                              state="disabled")
+            for label, cmd, checked in data["options"]:
+                if kind == "sprint" and checked:
+                    text, done_label = f"✓ {label}   (убрать из спринта)", f"убрано из {label}"
+                else:
+                    text, done_label = ("✓ " if checked else "    ") + label, label
+                if kind == "priority" and checked:  # текущий приоритет — ничего не меняем
+                    m.add_command(label=text, state="disabled")
+                    continue
+                m.add_command(label=text, command=lambda c_=cmd, l_=done_label: self.change_field(issue, what, l_, c_))
+        m.tk_popup(x, y)
 
     def _card_menu(self, e, issue):
         self.menu_issue = issue

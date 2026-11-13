@@ -45,6 +45,9 @@ def cm(t, who="ilya", name="Илья Гаврилов", text="Посмотрел
 
 CUR = {"name": "26.22", "archived": False, "released": False, "releaseDate": ms(10)}
 OLD = {"name": "26.20", "archived": True, "released": False, "releaseDate": ms(-20)}
+NEXT = {"name": "тестовый спринт 24", "archived": False, "released": False, "releaseDate": ms(24)}
+SPRINTS = [OLD, CUR, NEXT]
+PRIORITIES = ["Неотложный", "Критический", "Высокий", "Средний", "Низкий"]
 EVENTS = {"Открыта": [("-->", "Ждет БА"), ("--->", "Проработка БА"), ("отклонена", "Отклонена")],
           "Анализ": [("готово", "Готова")], "Ждет БА": [("в-работу", "В работе")]}
 ENUM_STATES = ["Open", "In Progress", "Fixed", "Old (archived)"]
@@ -129,6 +132,12 @@ class Handler(BaseHTTPRequestHandler):
         parts = p.split("/")
         if p.startswith("/api/issues/") and "/customFields/" in p:
             issue = next(i for i in State.issues if i["id"] == parts[3])
+            fid = parts[5]
+            if fid == "f-prio":
+                return self._send({"possibleEvents": [], "projectCustomField": {"bundle": {"values": [
+                    {"name": v, "archived": False} for v in PRIORITIES]}}})
+            if fid == "f-sprint":
+                return self._send({"possibleEvents": [], "projectCustomField": {"bundle": {"values": SPRINTS}}})
             f = issue["customFields"][0]
             if f["$type"] == "StateMachineIssueCustomField":
                 cur = f["value"]["name"]
@@ -168,16 +177,38 @@ class Handler(BaseHTTPRequestHandler):
                 return
             State.commands.append(body)
             issue = next(i for i in State.issues if i["id"] == body["issues"][0]["id"])
-            f = issue["customFields"][0]
+            fields = {f["name"]: f for f in issue["customFields"]}
             q = body["query"]
-            if f["$type"] == "StateMachineIssueCustomField":
-                ev = q.split("Статус задачи ", 1)[1]
-                target = dict(EVENTS.get(f["value"]["name"], [])).get(ev)
-            else:
-                target = q.split("{", 1)[1].rstrip("}") if "{" in q else None
-            if not target:
-                return self._send({"error_description": f"Переход недоступен: {q}"}, 400)
-            f["value"]["name"] = target
+            if "{" in q:  # как настоящий YouTrack пользователя: значения в фигурных скобках не принимаются
+                return self._send({"error_description": f"Ожидается значение без скобок: {q}"}, 400)
+            if q.startswith("Статус задачи "):
+                f, val = fields["Статус задачи"], q.split("Статус задачи ", 1)[1]
+                if f["$type"] == "StateMachineIssueCustomField":
+                    target = dict(EVENTS.get(f["value"]["name"], [])).get(val)
+                else:
+                    target = val if val in ENUM_STATES and "archived" not in val else None
+                if not target:
+                    return self._send({"error_description": f"Переход недоступен: {q}"}, 400)
+                f["value"]["name"] = target
+            elif q.startswith("Приоритет "):
+                val = q.split("Приоритет ", 1)[1]
+                if val not in PRIORITIES:
+                    return self._send({"error_description": f"Нет значения: {val}"}, 400)
+                fields["Приоритет"]["value"] = {"name": val}
+            else:  # «remove Спринт X add Спринт Y»
+                import re
+                ops = re.findall(r"(remove|add) Спринт (.+?)(?= (?:remove|add) Спринт |$)", q)
+                if not ops:
+                    return self._send({"error_description": f"Неизвестная команда: {q}"}, 400)
+                f = fields["Спринт"]
+                for op, name in ops:
+                    known = next((s for s in SPRINTS if s["name"] == name), None)
+                    if not known:
+                        return self._send({"error_description": f"Нет спринта: {name}"}, 400)
+                    if op == "remove":
+                        f["value"] = [s for s in f["value"] if s["name"] != name]
+                    elif all(s["name"] != name for s in f["value"]):
+                        f["value"].append(dict(known))
         else:
             return self._send({}, 404)
         self._send({})

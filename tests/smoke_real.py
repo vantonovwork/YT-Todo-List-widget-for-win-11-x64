@@ -66,6 +66,23 @@ for issue in issues[:3]:
         check(f"{issue['idReadable']}: команда «{opts[0][1]}» корректна (без выполнения)",
               cmds and not any(c.get("error") for c in cmds))
 
+def assist_ok(issue, command):
+    """YouTrack разбирает команду и сообщает об ошибках, но НЕ выполняет её."""
+    body = json.dumps({"query": command, "caret": len(command), "issues": [{"id": issue["id"]}]}).encode()
+    req = urllib.request.Request(cfg["base_url"].rstrip("/") + "/api/commands/assist?fields=commands(error)",
+                                 data=body, method="POST", headers={"Authorization": f"Bearer {token}",
+                                                                     "Content-Type": "application/json"})
+    cmds = json.load(urllib.request.urlopen(req, timeout=20)).get("commands", [])
+    return bool(cmds) and not any(c.get("error") for c in cmds)
+
+
+for kind, fname in (("priority", cfg["priority_field"]), ("sprint", cfg.get("sprint_field", ""))):
+    data = w.fetch_field_options(cfg["base_url"], token, issues[0], fname, kind)
+    cmds = [cmd for _, cmd, checked in data["options"] if not (kind == "priority" and checked)][:3]
+    check(f"{issues[0]['idReadable']}: список «{data['field']}» и команды корректны (без выполнения)",
+          data["options"] and all(assist_ok(issues[0], cmd) for cmd in cmds),
+          ", ".join(label for label, _, _ in data["options"]))
+
 desc = w.fetch_description(cfg["base_url"], token, issues[0])
 check("описание задачи загружается", isinstance(desc, str), f"{len(desc)} символов у {issues[0]['idReadable']}")
 check("горячая клавиша из настроек корректна", not cfg.get("hotkey") or w.parse_hotkey(cfg["hotkey"]) is not None,

@@ -242,12 +242,33 @@ class TestApi(unittest.TestCase):
         self.assertEqual(w.field_value(new["OE-1"], "State", "state")[0], "Ждет БА")
         # обычное поле (не workflow): все значения, кроме текущего и архивных; команда с фигурными скобками
         enum = w.fetch_state_options(self.base, mock.TOKEN, issues["OE-7"], "State")
-        self.assertEqual(enum, [("In Progress", "Статус задачи {In Progress}"), ("Fixed", "Статус задачи {Fixed}")])
+        self.assertEqual(enum, [("In Progress", "Статус задачи In Progress"), ("Fixed", "Статус задачи Fixed")],
+                         "значения без фигурных скобок — так их принимает YouTrack")
         w.apply_command(self.base, mock.TOKEN, issues["OE-7"], enum[0][1])
         # недопустимый переход → понятная ошибка
         with self.assertRaises(w.YTError) as ctx:
             w.apply_command(self.base, mock.TOKEN, issues["OE-3"], "Статус задачи нет-такого")
         self.assertIn("Переход недоступен", str(ctx.exception))
+
+    def test_priority_and_sprint_options(self):
+        issues = {i["idReadable"]: i for i in w.fetch_issues(self.base, mock.TOKEN, "q", 50)}
+        pr = w.fetch_field_options(self.base, mock.TOKEN, issues["OE-1"], "Priority", "priority")
+        self.assertEqual(pr["current"], ["Критический"])
+        self.assertIn(("Высокий", "Приоритет Высокий", False), pr["options"])
+        self.assertIn(("Критический", "Приоритет Критический", True), pr["options"])
+        w.apply_command(self.base, mock.TOKEN, issues["OE-1"], "Приоритет Высокий")
+        # спринт: текущий — «убрать», активные — перенос; архивный 26.20 не предлагается
+        sp = w.fetch_field_options(self.base, mock.TOKEN, issues["OE-1"], "", "sprint")
+        self.assertEqual(sp["current"], ["26.22"])
+        self.assertEqual(sp["options"], [("26.22", "remove Спринт 26.22", True),
+                                         ("тестовый спринт 24", "remove Спринт 26.22 add Спринт тестовый спринт 24", False)])
+        w.apply_command(self.base, mock.TOKEN, issues["OE-1"], sp["options"][1][1])
+        new = {i["idReadable"]: i for i in w.fetch_issues(self.base, mock.TOKEN, "q", 50)}
+        self.assertEqual(w.field_value(new["OE-1"], "Priority", "priority")[0], "Высокий")
+        self.assertEqual([n for n, _ in w.sprints_of(new["OE-1"], "")], ["тестовый спринт 24"])
+        # задача без спринта: только «добавить»
+        none = w.fetch_field_options(self.base, mock.TOKEN, issues["OE-4"], "", "sprint")
+        self.assertEqual(none["options"][0], ("26.22", "add Спринт 26.22", False))
 
     def test_state_options_no_field(self):
         with self.assertRaises(w.YTError):
