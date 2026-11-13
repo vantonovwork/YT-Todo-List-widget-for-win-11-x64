@@ -209,6 +209,20 @@ class Handler(BaseHTTPRequestHandler):
                         f["value"] = [s for s in f["value"] if s["name"] != name]
                     elif all(s["name"] != name for s in f["value"]):
                         f["value"].append(dict(known))
+        elif p.startswith("/api/issues/") and p.endswith("/comments"):
+            if not self._auth_and_mode():
+                return
+            issue = next((i for i in State.issues if i["id"] == p.split("/")[3]), None)
+            if issue is None:
+                return self._send({"error_description": "Issue not found"}, 404)
+            text = (body.get("text") or "").strip()
+            if not text:
+                return self._send({"error_description": "Comment text is empty"}, 400)
+            c = {"id": f"4-{len(State.commands) + len(issue['comments']) + 1}", "created": now, "deleted": False,
+                 "text": text, "author": {"login": "me", "fullName": "Я"}}
+            issue["comments"].append(c)
+            State.commands.append({"comment": text, "issue": issue["idReadable"]})
+            return self._send(c)
         else:
             return self._send({}, 404)
         self._send({})

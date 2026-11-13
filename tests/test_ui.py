@@ -11,6 +11,10 @@ import mock_youtrack as mock
 
 ctypes.windll.shcore.SetProcessDpiAwareness(1)
 w.load_icon_font()
+# Тестовые окна не должны отнимать фокус клавиатуры у пользователя, который в это время работает:
+# иначе его нажатия попадают в поля тестовых окон (и тесты «случайно» падают).
+REAL_FOCUS_FORCE = w.tk.Misc.focus_force  # для тестов, которым нужен настоящий фокус (клавиши)
+w.tk.Misc.focus_force = w.tk.Misc.focus_set
 
 
 class Ev:
@@ -113,7 +117,7 @@ class TestListAndFilters(Base):
         app.search_var.set("нет такого")
         app._apply_filter_now()
         self.assertIn("Ничего не найдено", self.texts(app))
-        app.search.focus_force()
+        REAL_FOCUS_FORCE(app.search)  # Esc приходит только в поле с настоящим фокусом
         pump(app, 0.1)
         app.search.event_generate("<Escape>")
         pump(app, 0.1)
@@ -244,6 +248,55 @@ class TestQuickViewAndComments(Base):
         self.assertEqual(self.opened[-1], f"{self.base}/issue/OE-1")
         self.click(app, "i0")
         self.assertNotIn("OE-1", app.expanded)
+
+    def test_write_comment(self):
+        app = self.make_app()
+        # ссылка «Написать комментарий» в быстром просмотре OE-2
+        self.click(app, "i1")
+        wait_for(app, lambda: isinstance(app.details.get("OE-2"), str), what="описание")
+        pump(app, 0.1)
+        self.assertIn("Написать комментарий", "\n".join(self.texts(app, "c1")))
+        self.click(app, "m1")
+        win = app._comment_win
+        self.assertTrue(win.winfo_exists())
+        self.assertEqual(win.title(), "Комментарий к OE-2")
+        # пустой текст не отправляется
+        win._send()
+        self.assertIn("Введите текст", win._err.cget("text"))
+        # черновик: закрыли с текстом — при повторном открытии текст на месте
+        win._text.insert("1.0", "Черновик ответа")
+        win._close()
+        self.assertFalse(win.winfo_exists())
+        app.open_comment_editor(self.card(app, "OE-2")["issue"])
+        win = app._comment_win
+        self.assertEqual(win._text.get("1.0", "end-1c"), "Черновик ответа")
+        # ошибка сервера: окно остаётся, текст не теряется
+        mock.control(self.base, "/test/mode?m=500")
+        win._send()
+        wait_for(app, lambda: "Не отправлено" in win._err.cget("text"), what="сообщение об ошибке")
+        self.assertTrue(win.winfo_exists())
+        self.assertEqual(win._text.get("1.0", "end-1c"), "Черновик ответа")
+        # успешная отправка
+        mock.control(self.base, "/test/mode?m=ok")
+        win._text.delete("1.0", "end")
+        win._text.insert("1.0", "Проверил, всё ок")
+        win._send()
+        wait_for(app, lambda: not win.winfo_exists(), what="окно закрылось после отправки")
+        self.assertEqual(mock.State.commands[-1], {"comment": "Проверил, всё ок", "issue": "OE-2"})
+        self.assertIn("комментарий добавлен", app.status_lbl.cget("text"))
+        pump(app, 0.2)
+        texts = "\n".join(self.texts(app, "c1"))
+        self.assertIn("Проверил, всё ок", texts, "новый комментарий сразу виден в карточке")
+        self.assertEqual(app.new_comments(self.card(app, "OE-2")["issue"]), 0, "свой комментарий не «новый»")
+        # после обновления списка — без уведомления о своём же комментарии
+        app.refresh()
+        wait_for(app, lambda: not app.loading, what="обновление")
+        pump(app, 0.2)
+        self.assertEqual(self.toasts, [])
+        # пункт контекстного меню
+        labels = [app.menu.entrycget(i, "label") for i in range(app.menu.index("end") + 1)
+                  if app.menu.type(i) not in ("separator",)]
+        self.assertIn("Написать комментарий…", labels)
 
     def test_title_click_opens_and_marks_read(self):
         w.save_seen({"OE-1": 0})

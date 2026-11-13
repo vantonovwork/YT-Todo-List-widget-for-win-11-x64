@@ -89,6 +89,7 @@ ICONS = {  # имя: (код из MaterialIconsRound-Regular.codepoints, зап�
     "check_circle": ("", "✔"), "open_in_new": ("", "↗"),
     "bolt": ("", "⚡"), "add": ("", "+"), "edit": ("", "✎"), "expand_more": ("", "▾"),
     "delete_outline": ("", "🗑"), "delete_sweep": ("", "🗑"),
+    "add_comment": ("", "✍"),
 }
 
 
@@ -308,6 +309,18 @@ def fetch_state_options(base_url: str, token: str, issue: dict, state_field: str
 
 def apply_command(base_url: str, token: str, issue: dict, command: str):
     _post(base_url, token, "/api/commands", {}, {"query": command, "issues": [{"id": issue["id"]}]})
+
+
+COMMENT_MAX = 10000  # ограничение длины комментария в окне виджета
+
+
+def post_comment(base_url: str, token: str, issue: dict, text: str) -> dict:
+    """Добавить комментарий к задаче. Возвращает созданный комментарий в том же виде, что и в списке задач."""
+    text = (text or "").strip()
+    if not text:
+        raise YTError("Пустой комментарий")
+    return _post(base_url, token, f"/api/issues/{issue['id']}/comments",
+                 {"fields": "id,created,deleted,text,author(login,fullName)"}, {"text": text[:COMMENT_MAX]})
 
 
 def fetch_me(base_url: str, token: str) -> str:
@@ -1223,6 +1236,7 @@ class Widget(tk.Tk):
                                   activeforeground=TEXT, bd=0, postcommand=self._fill_state_menu)
         self.menu.add_cascade(label="Сменить статус", menu=self.state_menu)
         self._state_cache = {}
+        self.menu.add_command(label="Написать комментарий…", command=lambda: self.open_comment_editor(self.menu_issue))
         self.menu.add_command(label="Отметить комментарии прочитанными",
                               command=lambda: self.mark_read(self.menu_issue))
         self.menu.add_command(label="Отметить все задачи прочитанными", command=self.mark_all_read)
@@ -2143,11 +2157,21 @@ class Widget(tk.Tk):
             body = c.create_text(lx, y, text=clean_markdown(cm.get("text") or "", 400) or "—", fill=TEXT,
                                  font=self.f_body, anchor="nw", width=width, tags=(t,))
             y = c.bbox(body)[3] + 8
-        link = c.create_text(lx, y + 2, text="Открыть в YouTrack", fill=ACCENT, font=self.f_link, anchor="nw",
-                             tags=(t, f"o{i}"))
+        # «Написать комментарий» (окно в виджете) и «Открыть в YouTrack» (браузер)
+        icon_font = (ICON_FAMILY, max(9, FS - 1)) if ICON_OK else self.f_small
+        reply_icon = c.create_text(lx, y + 1, text=ic("add_comment"), fill=ACCENT, font=icon_font, anchor="nw",
+                                   tags=(t, f"m{i}"))
+        reply = c.create_text(c.bbox(reply_icon)[2] + 4, y + 2, text="Написать комментарий", fill=ACCENT,
+                              font=self.f_link, anchor="nw", tags=(t, f"m{i}"))
+        link = c.create_text(c.bbox(reply)[2] + 18, y + 2, text="Открыть в YouTrack", fill=ACCENT, font=self.f_link,
+                             anchor="nw", tags=(t, f"o{i}"))
         c.create_text(c.bbox(link)[2] + 4, y + 1, text=ic("open_in_new"), fill=ACCENT,
-                      font=(ICON_FAMILY, max(9, FS - 1)) if ICON_OK else self.f_small, anchor="nw", tags=(t, f"o{i}"))
-        return c.bbox(link)[3] + 10
+                      font=icon_font, anchor="nw", tags=(t, f"o{i}"))
+        if c.bbox(link)[2] > rx:  # узкое окно — ссылки в две строки
+            dy = c.bbox(reply)[3] - y + 6
+            for item in c.find_withtag(f"o{i}"):
+                c.move(item, lx - c.bbox(link)[0], dy)
+        return max(c.bbox(item)[3] for item in c.find_withtag(f"o{i}")) + 10
 
     def _draw_badge(self, iid, count):
         """Красный кружок с числом новых комментариев на значке chat_bubble_outline."""
@@ -2183,7 +2207,7 @@ class Widget(tk.Tk):
                 if num.isdigit():
                     if head == "c" and card is None:
                         card = int(num)
-                    elif head in "tisokhexapr" and role is None:
+                    elif head in "tisokhexaprm" and role is None:
                         role = head
             if card is not None:
                 break
@@ -2301,6 +2325,8 @@ class Widget(tk.Tk):
             self.open_issue(issue)
         elif role == "i":
             self.toggle_details(issue)
+        elif role == "m":
+            self.open_comment_editor(issue)
         elif role == "s":
             self.toggle_plan(issue)
         elif role == "k":
@@ -2498,6 +2524,128 @@ class Widget(tk.Tk):
         e_title.focus_force()
         e_title.icursor("end")
         win._save, win._title_var, win._text = save, v_title, t_text  # для автотестов
+
+    # ----- комментарии в YouTrack
+    def open_comment_editor(self, issue):
+        """Окно нового комментария к задаче. Отправка — Ctrl+Enter; при закрытии текст сохраняется как черновик."""
+        if not issue:
+            return
+        iid = issue.get("idReadable")
+        drafts = self.__dict__.setdefault("_comment_drafts", {})
+        old = getattr(self, "_comment_win", None)
+        if old is not None and old.winfo_exists():
+            old._close()
+        BG_, CARD_, TEXT_, SUB_ = DLG_BG, DLG_CARD, DLG_TEXT, DLG_SUB
+        win = tk.Toplevel(self)
+        self._comment_win = win
+        win.title(f"Комментарий к {iid}")
+        win.configure(bg=BG_, padx=16, pady=12)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            v = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(v), ctypes.sizeof(v))
+        except Exception:
+            pass
+
+        tk.Label(win, text=iid, bg=BG_, fg=SUB_, font=(FONT, 9)).grid(row=0, column=0, sticky="w")
+        tk.Label(win, text=issue.get("summary") or "", bg=BG_, fg=TEXT_, font=(FONT, 10, "bold"), anchor="w",
+                 justify="left", wraplength=400).grid(row=1, column=0, sticky="we", pady=(0, 8))
+        t_text = tk.Text(win, bg=CARD_, fg=TEXT_, insertbackground=TEXT_, relief="flat", font=(FONT, 10),
+                         width=50, height=8, wrap="word", padx=6, pady=5, undo=True)
+        t_text.grid(row=2, column=0, sticky="we")
+        if drafts.get(iid):
+            t_text.insert("1.0", drafts[iid])
+        err = tk.Label(win, text="", bg=BG_, fg=ERR, font=(FONT, 9), anchor="w", justify="left", wraplength=400)
+        err.grid(row=3, column=0, sticky="we", pady=(6, 0))
+        tk.Label(win, text="Ctrl+Enter — отправить, Esc — закрыть (текст сохранится как черновик). "
+                           "Поддерживается разметка YouTrack, @логин — упомянуть коллегу.",
+                 bg=BG_, fg=SUB_, font=(FONT, 8), justify="left", wraplength=400).grid(row=4, column=0, sticky="w")
+
+        def text_now():
+            return t_text.get("1.0", "end-1c")
+
+        def close(_=None):
+            s = text_now().strip()
+            if s:
+                drafts[iid] = text_now()
+            else:
+                drafts.pop(iid, None)
+            win.destroy()
+            return "break"
+
+        def send(_=None):
+            text = text_now().strip()
+            if not text:
+                err.configure(text="Введите текст комментария")
+                t_text.focus_set()
+                return "break"
+            if str(b_send.cget("state")) == "disabled":
+                return "break"  # уже отправляется
+            b_send.configure(state="disabled", text="Отправляю…")
+            err.configure(text="")
+            token, base = unprotect(self.cfg["token_enc"]), self.cfg["base_url"]
+
+            def work():
+                try:
+                    res = post_comment(base, token, issue, text)
+                except YTError as ex:
+                    res = ex
+                except Exception as ex:  # noqa
+                    res = YTError(f"Ошибка: {ex}")
+                self.q.put((done, res))
+
+            threading.Thread(target=work, daemon=True).start()
+            return "break"
+
+        def done(res):
+            if isinstance(res, Exception):
+                if win.winfo_exists():
+                    b_send.configure(state="normal", text="Отправить")
+                    err.configure(text=f"Не отправлено: {res}")
+                return
+            drafts.pop(iid, None)
+            if win.winfo_exists():
+                win.destroy()
+            self._comment_added(issue, res)
+
+        btns = tk.Frame(win, bg=BG_)
+        btns.grid(row=5, column=0, sticky="e", pady=(10, 0))
+        bstyle = dict(relief="flat", font=(FONT, 9), padx=12, pady=4, cursor="hand2", bd=0)
+        tk.Button(btns, text="Отмена", command=close, bg=CARD_, fg=TEXT_, activebackground=DLG_HOVER,
+                  activeforeground=TEXT_, **bstyle).pack(side="left", padx=4)
+        b_send = tk.Button(btns, text="Отправить", command=send, bg="#0067c0", fg="white",
+                           activebackground="#1975c5", activeforeground="white", disabledforeground="#cfd8e3",
+                           **bstyle)
+        b_send.pack(side="left", padx=4)
+        win.bind("<Control-Return>", send)
+        win.bind("<Escape>", close)
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.update_idletasks()
+        x = max(0, min(self.winfo_x() - win.winfo_width() - 10, self.winfo_screenwidth() - win.winfo_width()))
+        win.geometry(f"+{x}+{max(0, self.winfo_y() + 40)}")
+        t_text.focus_force()
+        t_text.mark_set("insert", "end")
+        win._send, win._text, win._close, win._err = send, t_text, close, err  # для автотестов
+
+    def _comment_added(self, issue, comment):
+        """Комментарий создан: показываем его сразу, не дожидаясь обновления списка."""
+        iid = issue.get("idReadable")
+        if comment.get("created"):
+            issue.setdefault("comments", []).append(comment)
+            self.seen[iid] = max(self.seen.get(iid, 0), comment["created"])
+            save_seen(self.seen)
+            if self._notified is not None:
+                self._notified[iid] = max(self._notified.get(iid, 0), comment["created"])
+        self.expanded.add(iid)  # раскрыть карточку, чтобы было видно новый комментарий
+        if iid not in self.details:
+            self.toggle_details(issue)
+            self.expanded.add(iid)
+        self.status_lbl.configure(text=f"{iid}: комментарий добавлен", fg=BG_SUB)
+        self._data_sig = None  # следующее обновление перерисует список с данными сервера
+        self.render(keep_scroll=True)
 
     # ----- смена статуса
     def _prefetch_states(self, issue):

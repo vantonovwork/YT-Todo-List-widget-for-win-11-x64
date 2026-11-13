@@ -278,6 +278,21 @@ class TestApi(unittest.TestCase):
         issues = w.fetch_issues(self.base, mock.TOKEN, "q", 50)
         self.assertIn("обновить", w.fetch_description(self.base, mock.TOKEN, issues[0]))
 
+    def test_post_comment(self):
+        issue = w.fetch_issues(self.base, mock.TOKEN, "q", 50)[1]
+        c = w.post_comment(self.base, mock.TOKEN, issue, "  Проверил на тесте — **работает**  \n")
+        self.assertEqual(c["text"], "Проверил на тесте — **работает**")  # пробелы по краям убраны
+        self.assertEqual(c["author"]["login"], "me")
+        self.assertGreater(c["created"], 0)
+        again = {i["idReadable"]: i for i in w.fetch_issues(self.base, mock.TOKEN, "q", 50)}
+        self.assertEqual(again["OE-2"]["comments"][-1]["text"], c["text"])
+        with self.assertRaises(w.YTError):
+            w.post_comment(self.base, mock.TOKEN, issue, "   ")  # пустой — не отправляем
+        mock.control(self.base, "/test/mode?m=403")
+        with self.assertRaises(w.YTError) as ctx:
+            w.post_comment(self.base, mock.TOKEN, issue, "текст")
+        self.assertTrue(str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
