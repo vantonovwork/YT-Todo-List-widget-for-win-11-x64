@@ -71,8 +71,27 @@ def initial():
     ]
 
 
+def initial_mentions():
+    """Задачи, где упомянули пользователя «me» (запрос «mentions: me …»): две чужие и одна своя."""
+    return [
+        {"id": "4-50", "idReadable": "OE-50", "summary": "Чужая задача: нужна ваша оценка",
+         "customFields": [st("Анализ"), pr("Высокий", "#ff7a00"), due(None), sp()],
+         "comments": [cm(1500, text="Общий комментарий без упоминаний"),
+                      cm(2000, who="lazarev", name="Лазарев Алексей",
+                         text="@me посмотри, пожалуйста, **логи** выгрузки")]},
+        {"id": "4-51", "idReadable": "OE-51", "summary": "Чужая задача: вы уже ответили",
+         "customFields": [st("Открыта"), pr("Средний"), due(None), sp()],
+         "comments": [cm(1500, who="alina", name="Алина Малышева", text="@me нужна помощь"),
+                      cm(1600, who="me", name="Я", text="Посмотрел, всё ок")]},
+        {"id": "2-1", "idReadable": "OE-1", "summary": "Просроченная задача по выгрузке цен",
+         "customFields": [st("Открыта"), pr("Критический", "#e30000"), due(-2), sp(CUR)],
+         "comments": [cm(1000), cm(1200, who="lazarev", name="Лазарев Алексей", text="@ME глянь срочно")]},
+    ]
+
+
 class State:
     issues = initial()
+    mentions = initial_mentions()
     mode = "ok"
     commands = []
     requests = []
@@ -128,10 +147,15 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/users/me":
             return self._send({"login": "me"})
         if p == "/api/issues":
+            q = parse_qs(urlparse(self.path).query).get("query", [""])[0]
+            if "mentions" in q:
+                if State.mode == "mentions500":
+                    return self._send({"error_description": "mentions down"}, 500)
+                return self._send(State.mentions)
             return self._send(State.issues)
         parts = p.split("/")
         if p.startswith("/api/issues/") and "/customFields/" in p:
-            issue = next(i for i in State.issues if i["id"] == parts[3])
+            issue = next(i for i in State.issues + State.mentions if i["id"] == parts[3])
             fid = parts[5]
             if fid == "f-prio":
                 return self._send({"possibleEvents": [], "projectCustomField": {"bundle": {"values": [
@@ -157,6 +181,7 @@ class Handler(BaseHTTPRequestHandler):
         now = int(time.time() * 1000)
         if p == "/test/reset":
             State.issues, State.mode, State.commands, State.requests = initial(), "ok", [], []
+            State.mentions = initial_mentions()
         elif p == "/test/mode":
             State.mode = parse_qs(u.query).get("m", ["ok"])[0]
         elif p == "/test/bulk":
@@ -168,6 +193,9 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/test/many-comments":
             for i in State.issues[:5]:
                 i["comments"].append(cm(now))
+        elif p == "/test/mention":  # новое упоминание в чужой задаче OE-50
+            State.mentions[0]["comments"].append(cm(now, who="pavel", name="Павел Драничников",
+                                                    text="@me ещё вопрос по задаче"))
         elif p == "/test/new-issue":
             State.issues.append({"id": "2-9", "idReadable": "OE-9", "summary": "Новая задача: проверить промо",
                                  "customFields": [st("Открыта"), pr("Высокий", "#ff7a00"), due(3), sp()],

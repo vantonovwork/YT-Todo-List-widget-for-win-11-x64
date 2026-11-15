@@ -10,6 +10,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -26,6 +27,7 @@ CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
 SEEN_PATH = os.path.join(CFG_DIR, "seen.json")  # когда последний раз смотрели комментарии задачи
 PLAN_PATH = os.path.join(CFG_DIR, "day_plan.json")  # ID задач, отмеченных как «план на день»
+ATTN_PATH = os.path.join(CFG_DIR, "attention.json")  # упоминания, отмеченные вручную как «отвечено»
 URGENT_PATH = os.path.join(CFG_DIR, "urgent.json")  # свои срочные задачи (только в виджете, не в YouTrack)
 URGENT_TITLE_MAX, URGENT_TEXT_MAX = 100, 1000
 MIN_W, MIN_H = 340, 220  # минимальный размер окна
@@ -55,6 +57,7 @@ DEFAULTS = {
     "sprint_field": "",    # поле спринта; пусто — найти автоматически («Спринт», «Sprint»)
     "sprint_filter": [],   # выбранные спринты; пусто — все
     "tray": True,          # значок в трее; ✕ прячет виджет в трей
+    "mentions_query": "mentions: me #Unresolved",  # вкладка «Нужно внимание»: задачи, где вас упомянули
     "notify": True,        # уведомления Windows о новых задачах и комментариях
     "hotkey": "Win+Shift+Y",  # показать/спрятать виджет из любого окна; пусто — выключено
 }
@@ -90,6 +93,7 @@ ICONS = {  # имя: (код из MaterialIconsRound-Regular.codepoints, зап�
     "bolt": ("", "⚡"), "add": ("", "+"), "edit": ("", "✎"), "expand_more": ("", "▾"),
     "delete_outline": ("", "🗑"), "delete_sweep": ("", "🗑"),
     "add_comment": ("", "✍"),
+    "alternate_email": ("", "@"),
 }
 
 
@@ -523,6 +527,43 @@ def load_urgent() -> list:
                           "created": int(x.get("created") or 0), "done": bool(x.get("done")),
                           "done_at": int(x.get("done_at") or 0)})
     return items
+
+
+def mention_info(issue: dict, login: str):
+    """Упоминание @login в комментариях задачи: {time, author, text, count, replied} или None.
+    replied — после последнего упоминания вы сами написали комментарий."""
+    if not login:
+        return None
+    pat = re.compile(r"@" + re.escape(login) + r"(?![\w.-])", re.I)
+    comments = live_comments(issue)
+    hits = [c for c in comments if pat.search(c.get("text") or "")]
+    if not hits:
+        return None
+    last = max(hits, key=lambda c: c.get("created") or 0)
+    t = last.get("created") or 0
+    me = login.lower()
+    replied = any((c.get("created") or 0) > t and ((c.get("author") or {}).get("login") or "").lower() == me
+                  for c in comments)
+    author = last.get("author") or {}
+    return {"time": t, "author": author.get("fullName") or author.get("login") or "", "text": last.get("text") or "",
+            "count": len(hits), "replied": replied}
+
+
+def load_attn() -> dict:
+    try:
+        with open(ATTN_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_attn(data: dict):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    tmp = ATTN_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, ATTN_PATH)
 
 
 def save_urgent(items: list):
@@ -994,6 +1035,8 @@ class Widget(tk.Tk):
         self.seen = load_seen()
         self.plan, self.plan_done = load_plan()
         self.urgent = load_urgent()
+        self.mentions = []            # задачи, где вас упомянули (вкладка «Нужно внимание»)
+        self.attn_handled = load_attn()  # idReadable -> время упоминания, отмеченного вручную «отвечено»
         self._done_date = _today()
         self.expanded = set()      # карточки, раскрытые для быстрого просмотра
         self.details = {}          # idReadable -> описание задачи (или YTError / None = загружается)
@@ -1001,6 +1044,7 @@ class Widget(tk.Tk):
         self._hotkey_tid = None
         self.tray = None
         self._notified = None   # idReadable -> время последнего комментария, о котором уже уведомили
+        self._mention_seen = None  # idReadable -> время последнего упоминания, о котором уже знаем
         self._known_ids = None  # задачи из прошлой загрузки (чтобы заметить новые назначения)
         self.me_login = ""
 
@@ -1094,14 +1138,15 @@ class Widget(tk.Tk):
         tabs = tk.Frame(self.body, bg=BG)
         tabs.pack(fill="x", padx=10, pady=(6, 0))
         self.tab_widgets = {}
-        for key in ("all", "day", "urgent"):
+        tab_icons = {"day": "wb_sunny", "urgent": "bolt", "attention": "alternate_email"}
+        for key in ("all", "day", "urgent", "attention"):
             cell = tk.Frame(tabs, bg=BG, cursor="hand2")
             cell.pack(side="left", padx=(0, 2))
             top = tk.Frame(cell, bg=BG, cursor="hand2")
-            top.pack(padx=6, pady=3)
+            top.pack(padx=5, pady=3)
             icon_lbl = None
-            if key in ("day", "urgent"):
-                icon_lbl = tk.Label(top, text=ic("wb_sunny" if key == "day" else "bolt"), bg=BG,
+            if key in tab_icons:
+                icon_lbl = tk.Label(top, text=ic(tab_icons[key]), bg=BG,
                                     font=icon_font(FS + 1), cursor="hand2")
                 icon_lbl.pack(side="left", padx=(0, 3))
             lbl = tk.Label(top, text="", bg=BG, font=(FONT, max(9, FS - 2), "bold"), cursor="hand2")
@@ -1118,7 +1163,7 @@ class Widget(tk.Tk):
         self.clear_plan_btn.bind("<Button-1>", lambda e: self.clear_plan())
         self.clear_plan_btn.bind("<Enter>", lambda e: self.status_lbl.configure(text="Очистить план на день",
                                                                                 fg=BG_SUB))
-        self._short_tabs = self.winfo_width() < 470
+        self._short_tabs = self._tabs_level()
         self._update_tabs()
 
         search_wrap = tk.Frame(self.body, bg=BG)
@@ -1354,7 +1399,7 @@ class Widget(tk.Tk):
         save_cfg(self.cfg)
 
     def _on_canvas_resize(self, e):
-        short = self.winfo_width() < 470  # короткие названия вкладок в узком окне
+        short = self._tabs_level()  # чем уже окно, тем короче подписи вкладок
         if short != getattr(self, "_short_tabs", None):
             self._short_tabs = short
             self._update_tabs()
@@ -1565,7 +1610,67 @@ class Widget(tk.Tk):
                 c = comments[-1]
                 who = (c.get("author") or {}).get("fullName") or (c.get("author") or {}).get("login") or ""
                 more = f" (+{len(comments) - 1})" if len(comments) > 1 else ""
-                show_toast(f"Комментарий · {iid}{more}", f"{who}: {comment_snippet(c)}", url, summary)
+                tagged = mention_info({"comments": [c]}, self.me_login)  # в комментарии упомянули вас?
+                title = "Вас упомянули" if tagged else "Комментарий"
+                show_toast(f"{title} · {iid}{more}", f"{who}: {comment_snippet(c)}", url, summary)
+
+    # ----- «Нужно внимание»: задачи, где вас упомянули
+    def _on_mentions(self, issues):
+        """Новый список упоминаний: запомнить прочитанное, уведомить о новых упоминаниях в чужих задачах."""
+        mine = {i.get("idReadable") for i in self.issues}
+        first = self._mention_seen is None
+        if first:
+            self._mention_seen = {}
+        events = []
+        for issue in issues:
+            iid = issue.get("idReadable")
+            if not iid:
+                continue
+            if iid not in self.seen:  # задача впервые — её старые комментарии не считаем новыми
+                self.seen[iid] = last_comment_time(issue)
+            info = mention_info(issue, self.me_login)
+            t = info["time"] if info else 0
+            # о своих задачах уведомит общий механизм комментариев; здесь — только о чужих
+            if not first and t > self._mention_seen.get(iid, 0) and iid not in mine and info and not info["replied"]:
+                events.append((issue, info))
+            self._mention_seen[iid] = max(self._mention_seen.get(iid, 0), t)
+        save_seen(self.seen)
+        self.mentions = issues
+        if events and self.cfg.get("notify", True):
+            if len(events) > 3:
+                show_toast(f"Вас упомянули: {len(events)} задач", ", ".join(e[0]["idReadable"] for e in events[:6]),
+                           self.cfg["base_url"].rstrip("/") + "/issues")
+            else:
+                for issue, info in events:
+                    show_toast(f"Вас упомянули · {issue['idReadable']}",
+                               f"{info['author']}: {comment_snippet({'text': info['text']})}",
+                               self.issue_url(issue), issue.get("summary") or "")
+        self._update_tabs()
+
+    def attn_waiting(self, issue) -> bool:
+        """Упоминание ждёт ответа: вы не ответили комментарием и не отметили вручную «отвечено»."""
+        info = mention_info(issue, self.me_login)
+        if not info:
+            return False
+        return not info["replied"] and self.attn_handled.get(issue.get("idReadable"), 0) < info["time"]
+
+    def toggle_attn(self, issue):
+        """Клик по плашке «ждёт ответа / отвечено»: вручную отметить упоминание обработанным или вернуть."""
+        iid = issue.get("idReadable")
+        info = mention_info(issue, self.me_login)
+        if not info:
+            return
+        if self.attn_waiting(issue):
+            self.attn_handled[iid] = info["time"]
+        else:
+            self.attn_handled.pop(iid, None)
+        save_attn(self.attn_handled)
+        self.render(keep_scroll=True)
+
+    def _all_issues(self):
+        """Свои задачи + задачи с упоминаниями (без повторов) — для плана на день."""
+        mine = {i.get("idReadable") for i in self.issues}
+        return self.issues + [i for i in self.mentions if i.get("idReadable") not in mine]
 
     # ----- план на день
     def in_plan(self, issue) -> bool:
@@ -1624,24 +1729,33 @@ class Widget(tk.Tk):
             save_cfg(self.cfg)
             self.render()
 
+    def _tabs_level(self):
+        """0 — полные названия вкладок, 1 — короткие, 2 — у вкладок со значком только значок и число."""
+        wd = self.winfo_width()
+        return 0 if wd >= 640 else 1 if wd >= 470 else 2
+
     def _update_tabs(self):
         if not getattr(self, "tab_widgets", None):
             return
         accent = "#4cc2ff" if _lum(BG) < 0.5 else "#0067c0"
-        n_day = sum(1 for i in self.issues if self.in_plan(i)) if self.issues else len(self.plan)
+        n_day = sum(1 for i in self._all_issues() if self.in_plan(i)) if self.issues else len(self.plan)
         n_urgent = sum(1 for u in self.urgent if not u["done"])
-        short = getattr(self, "_short_tabs", False)  # узкое окно — короткие названия вкладок
-        texts = {"all": f"{'Все' if short else 'Все мои задачи'}  {len(self.issues) if self.issues else ''}".rstrip(),
-                 "day": f"{'День' if short else 'На день'}  {n_day if n_day else ''}".rstrip(),
-                 "urgent": f"Срочные  {n_urgent if n_urgent else ''}".rstrip()}
+        n_attn = sum(1 for i in self.mentions if self.attn_waiting(i))
+        lvl = int(getattr(self, "_short_tabs", 0) or 0)  # 0/1/2 — см. _tabs_level
+        names = {"all": ("Все мои задачи", "Все", "Все"), "day": ("На день", "День", ""),
+                 "urgent": ("Срочные", "Срочные", ""), "attention": ("Нужно внимание", "Внимание", "")}
+        counts = {"all": len(self.issues) if self.issues else "", "day": n_day or "", "urgent": n_urgent or "",
+                  "attention": n_attn or ""}
+        texts = {k: f"{names[k][lvl]}  {counts[k]}".strip() for k in names}
         cur = self.cfg.get("tab", "all")
         for key, (lbl, bar, icon_lbl) in self.tab_widgets.items():
             active = key == cur
             lbl.configure(text=texts[key], fg=BG_TEXT if active else BG_SUB)
             if icon_lbl is not None:
-                on_color = "#f5b301" if key == "day" else "#ef6c00"
-                # у «Срочных» значок оранжевый, пока есть невыполненные задачи — даже на другой вкладке
-                icon_lbl.configure(fg=on_color if active or (key == "urgent" and n_urgent) else BG_SUB)
+                on_color = {"day": "#f5b301", "urgent": "#ef6c00", "attention": BADGE}[key]
+                # «Срочные» и «Нужно внимание» подсвечены, пока есть что делать — даже на другой вкладке
+                busy = (key == "urgent" and n_urgent) or (key == "attention" and n_attn)
+                icon_lbl.configure(fg=on_color if active or busy else BG_SUB)
             bar.configure(bg=accent if active else BG)
         if cur == "day" and self.plan:
             self.clear_plan_btn.pack(side="right")
@@ -1695,6 +1809,13 @@ class Widget(tk.Tk):
                         except YTError:
                             pass
                     data = fetch_issues(cfg["base_url"], token, cfg["query"], int(cfg["max_issues"]))
+                    # вкладка «Нужно внимание»: задачи, где вас упомянули (их может не быть среди ваших)
+                    mq = (cfg.get("mentions_query") or "").strip()
+                    if mq:
+                        try:
+                            self.q.put(("mentions", fetch_issues(cfg["base_url"], token, mq, 100)))
+                        except YTError:
+                            pass  # основной список важнее — упоминания подтянутся при следующем обновлении
                     self.q.put(("issues", data))
                 except YTError as e:
                     self.q.put(("error", str(e)))
@@ -1728,10 +1849,12 @@ class Widget(tk.Tk):
                     self.status_lbl.configure(text=(f"{note[0]} · " if fresh else "") + f"Обновлено в {self.last_ok}",
                                               fg=BG_SUB)
                     # автообновление раз в N минут: если в YouTrack ничего не поменялось — не перерисовываем
-                    sig = hash(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+                    sig = hash(json.dumps([payload, self.mentions], sort_keys=True, ensure_ascii=False))
                     if sig != self._data_sig or not self.cards:
                         self._data_sig = sig
                         self.render(keep_scroll=True)
+                elif kind == "mentions":
+                    self._on_mentions(payload)
                 elif kind == "error":
                     self.loading = False
                     suffix = f" · данные от {self.last_ok}" if self.last_ok else ""
@@ -1914,9 +2037,12 @@ class Widget(tk.Tk):
                 self.cards.append({"kind": "local", "id": u["id"], "summary": u["title"], "text": u["text"],
                                    "created": u["created"], "done": u["done"], "item": u,
                                    "hay": f"{u['title']} {u['text']}".lower()})
+        if tab == "attention":  # где вас упомянули: ждущие ответа сверху, внутри — новые упоминания сверху
+            issues = sorted(self.mentions, key=lambda i: (not self.attn_waiting(i),
+                                                          -((mention_info(i, self.me_login) or {}).get("time") or 0)))
         if tab == "day":  # порядок — как расставил пользователь, выполненные — в конец
             order = {iid: n for n, iid in enumerate(self.plan)}
-            issues = sorted((i for i in self.issues if self.in_plan(i)),
+            issues = sorted((i for i in self._all_issues() if self.in_plan(i)),
                             key=lambda i: (i.get("idReadable") in self.plan_done, order.get(i.get("idReadable"), 0)))
         for issue in issues:
             if tab == "day" and not self.in_plan(issue):
@@ -1925,6 +2051,9 @@ class Widget(tk.Tk):
             prio, prio_color = field_value(issue, pf, "priority")
             summary = issue.get("summary") or "(без названия)"
             due = due_info(due_date(issue, self.cfg.get("due_field", "")))
+            mention = mention_info(issue, self.me_login) if tab == "attention" else None
+            if mention:
+                mention = dict(mention, waiting=self.attn_waiting(issue))
             self.cards.append({
                 "issue": issue, "id": issue.get("idReadable", ""), "summary": summary,
                 "state": state, "state_colors": chip_colors(state, state_color) if state else None,
@@ -1936,7 +2065,9 @@ class Widget(tk.Tk):
                 "bar": chip_colors(prio, prio_color)[0] if prio else "#3a3a3a",
                 "hay": f"{issue.get('idReadable', '')} {summary} {state or ''} {prio or ''} "
                        f"{due[0] if due else ''} "
-                       f"{' '.join(n for n, _ in sprints_of(issue, self.cfg.get('sprint_field', '')))}".lower(),
+                       f"{' '.join(n for n, _ in sprints_of(issue, self.cfg.get('sprint_field', '')))} "
+                       f"{(mention['author'] + ' ' + mention['text']) if mention else ''}".lower(),
+                "mention": mention,
             })
         self._update_header_count()
         self._update_tabs()
@@ -1961,6 +2092,13 @@ class Widget(tk.Tk):
                 return "Ничего не найдено"
             return ("Срочных задач нет.\n\nНажмите «+ Новая», чтобы записать короткое дело — "
                     "например, «Написать Ивану, уточнить сроки».\nЗадачи хранятся только в виджете.")
+        if self.cfg.get("tab") == "attention" and not (self._search_text() or self._prio_filter()
+                                                        or self.cfg.get("due_hot") or self.cfg.get("sprint_filter")):
+            if not self.cfg.get("mentions_query"):
+                return "Вкладка выключена: в настройках не задан запрос упоминаний."
+            if self.issues or self.last_ok:
+                return ("Вас нигде не упоминали 🎉\n\nЗдесь появятся незакрытые задачи, где коллеги "
+                        "отметили вас в комментарии через @.")
         if (self._search_text() or self._prio_filter() or self.cfg.get("due_hot")
                 or self.cfg.get("sprint_filter")):
             return "Ничего не найдено"
@@ -2071,9 +2209,25 @@ class Widget(tk.Tk):
                               font=self.f_title_done if card["done"] else self.f_title, anchor="nw",
                               width=wrap, tags=(t, f"t{i}"))
         cy = c.bbox(title)[3] + 6
+        m = card.get("mention")
+        if m:  # «Нужно внимание»: кто и когда упомянул + цитата комментария
+            when = time.strftime("%d.%m %H:%M", time.localtime(m["time"] / 1000)) if m["time"] else ""
+            more = f" · упоминаний: {m['count']}" if m["count"] > 1 else ""
+            head = c.create_text(tx, cy, text=f"@ {m['author']} · {when}{more}", fill=SUB, font=self.f_small_bold,
+                                 anchor="nw", width=wrap, tags=(t,))
+            cy = c.bbox(head)[3] + 2
+            quote = c.create_text(tx + 8, cy, text=clean_markdown(m["text"], 220) or "—",
+                                  fill=TEXT if m["waiting"] else SUB, font=self.f_body, anchor="nw",
+                                  width=max(60, wrap - 8), tags=(t,))
+            qb = c.bbox(quote)
+            c.create_line(tx + 1, cy + 1, tx + 1, qb[3], fill=BADGE if m["waiting"] else SUB, width=2, tags=(t,))
+            cy = qb[3] + 6
         # (подпись, значение, цвета, роль): роль a/p/r — плашка кликабельна и открывает список значений из YouTrack
         rows = [("Статус", card["state"], card["state_colors"], "a"),
                 ("Приоритет", card["prio"], card["prio_colors"], "p")]
+        if m:  # роль w — клик переключает «ждёт ответа» ↔ «отвечено»
+            rows.insert(0, ("Ответ", "ждёт ответа" if m["waiting"] else "отвечено",
+                            ("#e5484d", "#ffffff") if m["waiting"] else ("#2e7d32", "#ffffff"), "w"))
         if card["due"]:  # строка «Срок» — только если срок задан
             dtext, dbg, dfg, _ = card["due"]
             rows.append(("Срок", dtext, (dbg, dfg) if dbg else chip_colors(dtext, None), None))
@@ -2091,11 +2245,12 @@ class Widget(tk.Tk):
             if value:
                 cbg, cfg = colors
                 tw = self.f_chip.measure(value)
-                aw = self.f_arrow.measure(arrow) if role else 0  # стрелка ▾ — подсказка, что это выпадающий список
+                dropdown = role in ("a", "p", "r")
+                aw = self.f_arrow.measure(arrow) if dropdown else 0  # стрелка ▾ — подсказка, что это выпадающий список
                 c.create_rectangle(vx, cy, vx + tw + 10 + aw, cy + self.line_chip + 2, fill=cbg, outline="",
                                    tags=tags)
                 c.create_text(vx + 5, cy + 1, text=value, fill=cfg, font=self.f_chip, anchor="nw", tags=tags)
-                if role:
+                if dropdown:
                     c.create_text(vx + 5 + tw + aw / 2 + 1, cy + (self.line_chip + 2) / 2, text=arrow, fill=cfg,
                                   font=self.f_arrow, tags=tags)
             elif role:  # пусто, но можно выбрать: «— ▾» в рамке
@@ -2207,7 +2362,7 @@ class Widget(tk.Tk):
                 if num.isdigit():
                     if head == "c" and card is None:
                         card = int(num)
-                    elif head in "tisokhexaprm" and role is None:
+                    elif head in "tisokhexaprmw" and role is None:
                         role = head
             if card is not None:
                 break
@@ -2333,6 +2488,8 @@ class Widget(tk.Tk):
             self.toggle_done(issue)
         elif role in self.FIELD_MENUS:  # клик по плашке статуса / приоритета / спринта
             self.open_field_menu(card, role)
+        elif role == "w":  # «ждёт ответа» ↔ «отвечено» на вкладке «Нужно внимание»
+            self.toggle_attn(issue)
 
     # ----- быстрый просмотр
     def toggle_details(self, issue):
@@ -3005,6 +3162,7 @@ class Widget(tk.Tk):
             self._data_sig = None
             self._notified = None   # после смены запроса не считаем «старые» задачи новыми
             self._known_ids = None
+            self._mention_seen = None
             self.refresh()
 
         def font_size():

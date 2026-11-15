@@ -119,6 +119,29 @@ class TestText(unittest.TestCase):
         self.assertEqual(w.comment_snippet(c), "Смотри лог важно")
 
 
+class TestMentions(unittest.TestCase):
+    def test_mention_info(self):
+        c = lambda t, who, text: {"created": t, "text": text, "author": {"login": who, "fullName": who.title()}}
+        i = issue_with(comments=[c(1, "a", "просто текст"), c(2, "b", "@Vladislav.Antonov глянь"),
+                                 c(3, "c", "повторно @vladislav.antonov, срочно")])
+        info = w.mention_info(i, "Vladislav.Antonov")
+        self.assertEqual((info["time"], info["author"], info["count"], info["replied"]), (3, "C", 2, False))
+        i["comments"].append(c(4, "Vladislav.Antonov", "ответил"))
+        self.assertTrue(w.mention_info(i, "Vladislav.Antonov")["replied"])
+        # не путаем с другим логином, у которого ваш — префикс, и с почтой
+        other = issue_with(comments=[c(1, "a", "@Vladislav.Antonova и mail@Vladislav.Antonov.ru")])
+        self.assertIsNone(w.mention_info(other, "Vladislav.Antonov"))
+        self.assertIsNone(w.mention_info(i, ""))
+
+    def test_attn_storage(self):
+        os.makedirs(w.CFG_DIR, exist_ok=True)
+        w.save_attn({"OE-1": 123})
+        self.assertEqual(w.load_attn(), {"OE-1": 123})
+        with open(w.ATTN_PATH, "w", encoding="utf-8") as f:
+            f.write("[]")
+        self.assertEqual(w.load_attn(), {})
+
+
 class TestHotkey(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(w.parse_hotkey("Win+Shift+Y"), (0x8 | 0x4, ord("Y")))

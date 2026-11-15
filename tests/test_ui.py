@@ -34,7 +34,7 @@ class Base(unittest.TestCase):
 
     def setUp(self):
         mock.control(self.base, "/test/reset")
-        for p in (w.PLAN_PATH, w.SEEN_PATH, w.URGENT_PATH):
+        for p in (w.PLAN_PATH, w.SEEN_PATH, w.URGENT_PATH, w.ATTN_PATH):
             if os.path.exists(p):
                 os.remove(p)
         self.toasts, self.boxes, self.opened = [], [], []
@@ -48,7 +48,7 @@ class Base(unittest.TestCase):
     def make_app(self, **cfg):
         base = dict(w.DEFAULTS, base_url=self.base, token_enc=w.protect(mock.TOKEN), geometry="440x700+60+60",
                     hotkey="", tray=False, notify=True, tray_hint_shown=True)
-        base["geometry"] = "520x700+60+60"  # широкое окно — полные названия вкладок
+        base["geometry"] = "700x700+60+60"  # широкое окно — полные названия вкладок
         base.update(cfg)
         w.save_cfg(base)
         app = w.Widget(queue.Queue())
@@ -735,6 +735,71 @@ class TestUrgent(Base):
         wait_for(app, lambda: "HTTP 500" in app.status_lbl.cget("text"), what="ошибка сервера")
         pump(app, 0.3)
         self.assertEqual(self.ids(app), ["U-1"], "срочные задачи видны, даже когда YouTrack недоступен")
+
+
+class TestAttention(Base):
+    """Вкладка «Нужно внимание»: задачи, где вас упомянули (в том числе чужие)."""
+
+    def test_tab_cards_and_toggle(self):
+        app = self.make_app()
+        wait_for(app, lambda: len(app.mentions) == 3, what="загрузка упоминаний")
+        self.assertIn("Нужно внимание  2", app.tab_widgets["attention"][0].cget("text"),
+                      "ждут ответа OE-50 и OE-1 (в OE-51 вы уже ответили)")
+        app.set_tab("attention")
+        pump(app, 0.1)
+        self.assertEqual(self.ids(app), ["OE-50", "OE-1", "OE-51"], "ждущие ответа сверху, новые упоминания выше")
+        texts = "\n".join(self.texts(app))
+        for t in ("@ Лазарев Алексей", "посмотри, пожалуйста, логи выгрузки", "ждёт ответа", "отвечено", "Ответ"):
+            self.assertIn(t, texts)
+        self.assertIn("Статус", texts, "у чужих задач тоже есть статус/приоритет с выпадающими списками")
+        # ручная отметка «отвечено» — клик по плашке
+        self.click(app, "w0")
+        self.assertEqual(self.ids(app), ["OE-1", "OE-50", "OE-51"])
+        self.assertIn("Нужно внимание  1", app.tab_widgets["attention"][0].cget("text"))
+        self.assertIn("OE-50", w.load_attn())
+        # новое упоминание после ручной отметки — снова «ждёт ответа» + уведомление
+        mock.control(self.base, "/test/mention")
+        app.refresh()
+        wait_for(app, lambda: not app.loading, what="обновление")
+        pump(app, 0.2)
+        self.assertEqual(self.ids(app)[0], "OE-50")
+        self.assertIn(("Вас упомянули · OE-50", "Павел Драничников: @me ещё вопрос по задаче"),
+                      [t[:2] for t in self.toasts])
+        # вернуть отметку обратно кликом по «отвечено» у OE-51 → снова ждёт? нет: там вы ответили комментарием
+        idx = self.ids(app).index("OE-51")
+        self.click(app, f"w{idx}")
+        self.assertIn("отвечено", self.texts(app, f"c{self.ids(app).index('OE-51')}"))
+
+    def test_plan_with_foreign_issue_and_search(self):
+        app = self.make_app(tab="attention")
+        wait_for(app, lambda: app.visible, what="карточки упоминаний")
+        self.click(app, "s0")  # звёздочка чужой задачи OE-50
+        self.assertIn("OE-50", app.plan)
+        app.set_tab("day")
+        self.assertEqual(self.ids(app), ["OE-50"], "чужая задача из упоминаний попадает в план на день")
+        app.set_tab("attention")
+        app.search.event_generate("<FocusIn>")
+        app.search_var.set("алина")
+        app._apply_filter_now()
+        self.assertEqual(self.ids(app), ["OE-51"], "поиск по автору упоминания")
+
+    def test_mentions_error_keeps_main_list(self):
+        mock.control(self.base, "/test/mode?m=mentions500")
+        app = self.make_app()
+        self.assertEqual(len(app.cards), 6, "ошибка загрузки упоминаний не ломает основной список")
+        self.assertEqual(app.mentions, [])
+        app.set_tab("attention")
+        self.assertIn("Вас нигде не упоминали", "".join(self.texts(app)))
+
+    def test_narrow_tabs_fit(self):
+        app = self.make_app()
+        for wd, label in ((700, "Нужно внимание"), (520, "Внимание"), (340, "")):
+            app.geometry(f"{wd}x700")
+            pump(app, 0.4)
+            text = app.tab_widgets["attention"][0].cget("text")
+            self.assertTrue(text.startswith(label) if label else not any(ch.isalpha() for ch in text), (wd, text))
+            row = app.tab_widgets["all"][0].master.master.master
+            self.assertLessEqual(row.winfo_reqwidth(), row.winfo_width() + 1, f"вкладки помещаются при {wd}")
 
 
 class TestCollapse(Base):
