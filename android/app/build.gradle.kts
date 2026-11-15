@@ -18,8 +18,8 @@ android {
         applicationId = "app.ytwidget.todo"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.3.0"
+        versionCode = 11
+        versionName = "1.7.0"
     }
 
     signingConfigs {

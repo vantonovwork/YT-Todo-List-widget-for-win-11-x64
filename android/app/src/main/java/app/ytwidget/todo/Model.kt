@@ -59,7 +59,23 @@ sealed class Event {
     data class NewIssue(val issue: Issue) : Event()
     data class NewComments(val issue: Issue, val comments: List<Comment>) : Event()
     data class Mentioned(val issue: Issue, val mention: Mention) : Event()
+    /** Статус задачи под наблюдением сменился; author — кто сменил (из истории задачи, может быть неизвестен). */
+    data class StateChanged(val issue: Issue, val from: String, val to: String, val author: String = "") : Event()
 }
+
+/** Тип уведомления: отдельный переключатель в настройках и отдельный канал Android. */
+enum class NotifyKind(val channel: String, val title: String, val important: Boolean) {
+    MENTION("mention", "Упоминания", true),
+    ASSIGNED("assigned", "Назначенные задачи", true),
+    COMMENT("comment", "Новые комментарии", false),
+    STATUS("status", "Смена статуса", false),
+}
+
+/** Задачи под наблюдением: последний известный статус и время последнего комментария по каждой. */
+data class WatchState(val states: Map<String, String>, val comments: Map<String, Long>)
+
+/** Запись истории задачи о смене поля. */
+data class FieldChange(val time: Long, val login: String, val author: String, val field: String, val added: String)
 
 /** Своя срочная задача: хранится только в приложении, в YouTrack не попадает (как в десктопной версии). */
 data class UrgentTask(
@@ -431,6 +447,64 @@ object Model {
             notified[id] = maxOf(notified[id] ?: 0L, last)
         }
         return events to NotifyState(notified, issues.map { it.idReadable }.filter { it.isNotEmpty() }.toSet())
+    }
+
+    /**
+     * События по задачам под наблюдением: новые комментарии коллег и смена статуса.
+     * prev == null — первая загрузка, только запоминаем. Задачи из основного списка (own) о комментариях
+     * не сообщают — это уже делает computeEvents. Задача, впервые попавшая под наблюдение, событий не даёт.
+     */
+    fun watchEvents(watched: List<Issue>, prev: WatchState?, own: Set<String>, seen: Map<String, Long>, me: String):
+        Pair<List<Event>, WatchState> {
+        val states = mutableMapOf<String, String>()
+        val comments = mutableMapOf<String, Long>()
+        val events = mutableListOf<Event>()
+        for (issue in watched) {
+            val id = issue.idReadable
+            if (id.isEmpty()) continue
+            val state = issue.state?.text.orEmpty()
+            states[id] = state
+            val known = prev != null && (id in prev.states || id in prev.comments)
+            val base = maxOf(prev?.comments?.get(id) ?: 0L, seen[id] ?: 0L)
+            comments[id] = maxOf(base, issue.lastCommentTime)
+            if (!known) continue
+            val old = prev!!.states[id].orEmpty()
+            if (old.isNotEmpty() && state.isNotEmpty() && old != state) events += Event.StateChanged(issue, old, state)
+            if (id !in own) {
+                val fresh = issue.comments.filter { it.created > base && !it.login.equals(me, ignoreCase = true) }
+                if (fresh.isNotEmpty()) events += Event.NewComments(issue, fresh)
+            }
+        }
+        return events to WatchState(states, comments)
+    }
+
+    /** История задачи (/activities, CustomFieldCategory) → смены полей, новые первыми. */
+    fun parseFieldChanges(json: String): List<FieldChange> {
+        val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { a ->
+            val author = a.optJSONObject("author")
+            val added = a.opt("added")
+            val addedText = when (added) {
+                is JSONArray -> (0 until added.length()).mapNotNull { added.optJSONObject(it)?.optString("name") }.joinToString(", ")
+                is JSONObject -> added.optString("name")
+                else -> ""
+            }
+            FieldChange(a.optLong("timestamp"), author?.optString("login").orEmpty(),
+                author?.optString("fullName").orEmpty().ifEmpty { author?.optString("login").orEmpty() },
+                a.optJSONObject("field")?.optString("name").orEmpty(), addedText)
+        }.sortedByDescending { it.time }
+    }
+
+    /** Кто последним поставил полю field значение value; null — не нашли в истории. */
+    fun whoChanged(changes: List<FieldChange>, field: String, value: String): FieldChange? =
+        changes.firstOrNull { it.field.equals(field, ignoreCase = true) && (value.isEmpty() || it.added.equals(value, ignoreCase = true)) }
+
+    /** Тип уведомления; комментарий с @вами — это упоминание. */
+    fun kindOf(ev: Event, me: String): NotifyKind = when (ev) {
+        is Event.Mentioned -> NotifyKind.MENTION
+        is Event.NewComments -> if (ev.comments.any { mentions(it.text, me) }) NotifyKind.MENTION else NotifyKind.COMMENT
+        is Event.StateChanged -> NotifyKind.STATUS
+        is Event.NewIssue -> NotifyKind.ASSIGNED
     }
 
     /** Порядок плана на день: как расставил пользователь, выполненные — в конце. */

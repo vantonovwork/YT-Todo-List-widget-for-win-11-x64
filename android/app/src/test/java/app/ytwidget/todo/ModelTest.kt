@@ -255,4 +255,59 @@ class ModelTest {
         val arr = JSONArray().put(issue("OE-1")).put(issue("OE-2"))
         assertEquals(listOf("OE-1", "OE-2"), Model.parseIssues(arr.toString(), FieldNames(), now).map { it.idReadable })
     }
+
+    // ---------------------------------------------------------------- наблюдение и типы уведомлений
+    private fun st(name: String) = field("State", "StateMachineIssueCustomField", enumV(name))
+
+    @Test fun watchStatusAndComments() {
+        val a = parse(issue("OE-10", st("Открыта"), comments = listOf(comment(1000))))
+        val (first, w1) = Model.watchEvents(listOf(a), null, emptySet(), emptyMap(), "vlad")
+        assertTrue("первая загрузка — без уведомлений", first.isEmpty())
+        val a2 = parse(issue("OE-10", st("В работе"), comments = listOf(comment(1000), comment(2000, "olga", "Готово"),
+            comment(3000, "vlad", "Спасибо"))))
+        val fresh = parse(issue("OE-11", st("Открыта"), comments = listOf(comment(500))))  // только что поставили звёздочку
+        val (ev, w2) = Model.watchEvents(listOf(a2, fresh), w1, emptySet(), emptyMap(), "vlad")
+        assertEquals(2, ev.size)
+        val sc = ev.filterIsInstance<Event.StateChanged>().single()
+        assertEquals("Открыта" to "В работе", sc.from to sc.to)
+        val nc = ev.filterIsInstance<Event.NewComments>().single()
+        assertEquals(listOf("olga"), nc.comments.map { it.login })  // свой комментарий не в счёт
+        assertTrue("повторная проверка — тишина", Model.watchEvents(listOf(a2, fresh), w2, emptySet(), emptyMap(), "vlad").first.isEmpty())
+    }
+
+    @Test fun watchSkipsCommentsOfOwnIssuesAndReadOnes() {
+        val a = parse(issue("OE-12", st("Открыта"), comments = listOf(comment(1000))))
+        val (_, w1) = Model.watchEvents(listOf(a), null, emptySet(), emptyMap(), "vlad")
+        val a2 = parse(issue("OE-12", st("Открыта"), comments = listOf(comment(1000), comment(2000))))
+        // своя задача — о комментарии уже сообщил computeEvents
+        assertTrue(Model.watchEvents(listOf(a2), w1, setOf("OE-12"), emptyMap(), "vlad").first.isEmpty())
+        // прочитана в приложении после комментария
+        assertTrue(Model.watchEvents(listOf(a2), w1, emptySet(), mapOf("OE-12" to 2500L), "vlad").first.isEmpty())
+    }
+
+    @Test fun whoChangedState() {
+        val json = JSONArray()
+            .put(JSONObject().put("timestamp", 100).put("author", JSONObject().put("login", "olga").put("fullName", "Ольга"))
+                .put("field", JSONObject().put("name", "State")).put("added", JSONArray().put(JSONObject().put("name", "В работе"))))
+            .put(JSONObject().put("timestamp", 200).put("author", JSONObject().put("login", "vlad").put("fullName", "Влад"))
+                .put("field", JSONObject().put("name", "Приоритет")).put("added", JSONArray().put(JSONObject().put("name", "Высокий"))))
+            .toString()
+        val changes = Model.parseFieldChanges(json)
+        assertEquals(200L, changes.first().time)  // новые первыми
+        assertEquals("Ольга", Model.whoChanged(changes, "state", "В работе")?.author)
+        assertEquals(null, Model.whoChanged(changes, "State", "Готово"))
+    }
+
+    @Test fun notifyKinds() {
+        val i = parse(issue("OE-13"))
+        val c = Comment(1, "olga", "Ольга", "@vlad посмотри")
+        assertEquals(NotifyKind.MENTION, Model.kindOf(Event.NewComments(i, listOf(c)), "vlad"))
+        assertEquals(NotifyKind.COMMENT, Model.kindOf(Event.NewComments(i, listOf(c.copy(text = "ок"))), "vlad"))
+        assertEquals(NotifyKind.STATUS, Model.kindOf(Event.StateChanged(i, "A", "B"), "vlad"))
+        assertEquals(NotifyKind.ASSIGNED, Model.kindOf(Event.NewIssue(i), "vlad"))
+        val cfg = Config(notifyStatus = false)
+        assertTrue(cfg.allows(NotifyKind.MENTION))
+        assertTrue(!cfg.allows(NotifyKind.STATUS))
+        assertTrue(!Config(notify = false).allows(NotifyKind.MENTION))
+    }
 }

@@ -7,6 +7,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -63,6 +64,8 @@ import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarBorder
@@ -108,6 +111,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.Share
+import androidx.core.app.NotificationManagerCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -139,6 +148,7 @@ private fun argb(v: Long) = Color(v.toInt())
 fun App(vm: MainViewModel) {
     var settings by rememberSaveable { mutableStateOf(false) }
     val opened = vm.openedIssue()
+    vm.crash?.let { CrashDialog(vm, it) }
     when {
         settings || !vm.configured -> SettingsScreen(vm, canGoBack = vm.configured) { settings = false }
         opened != null -> IssueScreen(vm, opened)
@@ -372,27 +382,36 @@ fun IssueScreen(vm: MainViewModel, issue: Issue) {
                         modifier = Modifier.padding(top = 10.dp)) {
                         FieldChips(vm, issue, allSprints = true)
                     }
-                    SectionTitle("Описание")
-                    val d = vm.details[issue.idReadable]
-                    when {
-                        d == null -> Text("Загрузка…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        d.startsWith(MainViewModel.ERR) -> Text("Не удалось загрузить: ${d.drop(1)}", color = Color(0xFFE5484D))
-                        d.isBlank() -> Text("Нет описания", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        else -> Text(Model.cleanMarkdown(d, Int.MAX_VALUE), style = MaterialTheme.typography.bodyLarge)
-                    }
-                    SectionTitle(if (issue.comments.isEmpty()) "Комментариев нет" else "Комментарии (${issue.comments.size})")
-                    issue.comments.reversed().forEach { c ->  // новые сверху
-                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
-                            Column(Modifier.padding(12.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(c.author, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(c.created)),
-                                        style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // оформление как в YouTrack: HTML с сервера; не загрузился или выключено — свой показ
+                    val html = vm.rendered[issue.idReadable]
+                    val useHtml = vm.config.markdown && issue.idReadable !in vm.renderFailed
+                    if (useHtml && html != null) {
+                        YouTrackHtml(html, vm.config.baseUrl, vm::resource, Modifier.fillMaxWidth())
+                    } else if (useHtml) {
+                        SectionTitle("Описание")
+                        Text("Загрузка…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        SectionTitle("Описание")
+                        val d = vm.details[issue.idReadable]
+                        when {
+                            d == null -> Text("Загрузка…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            d.startsWith(MainViewModel.ERR) -> Text("Не удалось загрузить: ${d.drop(1)}", color = Color(0xFFE5484D))
+                            d.isBlank() -> Text("Нет описания", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else -> MarkdownText(d, vm.config.baseUrl, MaterialTheme.typography.bodyLarge, rich = vm.config.markdown)
+                        }
+                        SectionTitle(if (issue.comments.isEmpty()) "Комментариев нет" else "Комментарии (${issue.comments.size})")
+                        issue.comments.reversed().forEach { c ->  // новые сверху
+                            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+                                Column(Modifier.padding(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(c.author, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(c.created)),
+                                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    MarkdownText(c.text, vm.config.baseUrl, MaterialTheme.typography.bodyMedium, Modifier.padding(top = 4.dp), rich = vm.config.markdown)
                                 }
-                                Text(Model.cleanMarkdown(c.text, Int.MAX_VALUE).ifEmpty { "—" }, style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.padding(top = 4.dp))
                             }
                         }
                     }
@@ -578,7 +597,7 @@ private fun Details(vm: MainViewModel, issue: Issue) {
             d == null -> Text("Загрузка…", color = MaterialTheme.colorScheme.onSurfaceVariant)
             d.startsWith(MainViewModel.ERR) -> Text("Не удалось загрузить: ${d.drop(1)}", color = Color(0xFFE5484D))
             d.isBlank() -> Text("Нет описания", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            else -> Text(Model.cleanMarkdown(d, 700), style = MaterialTheme.typography.bodyMedium)
+            else -> MarkdownText(d, vm.config.baseUrl, MaterialTheme.typography.bodyMedium, maxBlocks = 6, rich = vm.config.markdown)
         }
         val comments = issue.comments.takeLast(3).reversed()
         Text(if (comments.isEmpty()) "Комментариев нет" else "Последние комментарии", style = MaterialTheme.typography.labelLarge,
@@ -590,7 +609,7 @@ private fun Details(vm: MainViewModel, issue: Issue) {
                 Text(SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date(c.created)),
                     style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Text(Model.cleanMarkdown(c.text, 400).ifEmpty { "—" }, style = MaterialTheme.typography.bodyMedium)
+            MarkdownText(c.text, vm.config.baseUrl, MaterialTheme.typography.bodyMedium, maxBlocks = 3, rich = vm.config.markdown)
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             TextButton(onClick = { vm.commentFor = issue.idReadable }, contentPadding = PaddingValues(0.dp)) {
@@ -843,65 +862,228 @@ fun SettingsScreen(vm: MainViewModel, canGoBack: Boolean, close: () -> Unit) {
     var prioField by rememberSaveable { mutableStateOf(cfg.priorityField) }
     var notify by rememberSaveable { mutableStateOf(cfg.notify) }
     var mentionsQuery by rememberSaveable { mutableStateOf(cfg.mentionsQuery) }
+    var watchQuery by rememberSaveable { mutableStateOf(cfg.watchQuery) }
+    var nMention by rememberSaveable { mutableStateOf(cfg.notifyMentions) }
+    var nComment by rememberSaveable { mutableStateOf(cfg.notifyComments) }
+    var nStatus by rememberSaveable { mutableStateOf(cfg.notifyStatus) }
+    var nAssigned by rememberSaveable { mutableStateOf(cfg.notifyAssigned) }
+    var section by rememberSaveable { mutableStateOf(0) }  // 0 — основные, 1 — уведомления
     var test by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
     Scaffold(topBar = {
-        TopAppBar(title = { Text("Настройки") }, navigationIcon = {
-            if (canGoBack) IconButton(onClick = close) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад") }
-        })
+        Column {
+            TopAppBar(title = { Text("Настройки") }, navigationIcon = {
+                if (canGoBack) IconButton(onClick = close) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад") }
+            })
+            TabRow(selectedTabIndex = section, containerColor = Color.Transparent) {
+                Tab(selected = section == 0, onClick = { section = 0 }, icon = { Icon(Icons.Rounded.Settings, null) },
+                    text = { TabText("Основные") })
+                Tab(selected = section == 1, onClick = { section = 1 },
+                    icon = { Icon(if (notify) Icons.Rounded.Notifications else Icons.Rounded.NotificationsOff, null) },
+                    text = { TabText("Уведомления") })
+                Tab(selected = section == 2, onClick = { section = 2 }, icon = { Icon(Icons.Rounded.BugReport, null) },
+                    text = { TabText("Журнал") })
+            }
+        }
     }) { pad ->
         Box(Modifier.padding(pad).fillMaxSize(), contentAlignment = Alignment.TopCenter) {
             Column(Modifier.widthIn(max = 720.dp).verticalScroll(rememberScrollState()).padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(url, { url = it }, label = { Text("Адрес YouTrack") }, singleLine = true,
-                    placeholder = { Text("https://company.youtrack.cloud") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(token, { token = it }, label = { Text("Постоянный токен (permanent token)") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
-                    supportingText = {
-                        Text("Профиль → Аккаунт и безопасность → Токены → Новый токен" +
-                            if (vm.hasToken()) "\n✓ токен сохранён — оставьте поле пустым, чтобы не менять" else "")
-                    })
-                OutlinedTextField(query, { query = it }, label = { Text("Запрос (синтаксис поиска YouTrack)") },
-                    modifier = Modifier.fillMaxWidth(), supportingText = { Text("например: ${Config.DEFAULT_QUERY}") })
-                OutlinedTextField(mentionsQuery, { mentionsQuery = it }, label = { Text("Запрос вкладки «Нужно внимание»") },
-                    modifier = Modifier.fillMaxWidth(), singleLine = true,
-                    supportingText = { Text("задачи, где вас упомянули через @; пусто — вкладка выключена. По умолчанию: ${Config.DEFAULT_MENTIONS}") })
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp),
-                    maxItemsInEachRow = if (isPhone()) 1 else 2) {
-                    OutlinedTextField(stateField, { stateField = it }, label = { Text("Поле статуса") }, singleLine = true, modifier = Modifier.weight(1f))
-                    OutlinedTextField(prioField, { prioField = it }, label = { Text("Поле приоритета") }, singleLine = true, modifier = Modifier.weight(1f))
+                if (section == 0) {
+                    OutlinedTextField(url, { url = it }, label = { Text("Адрес YouTrack") }, singleLine = true,
+                        placeholder = { Text("https://company.youtrack.cloud") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(token, { token = it }, label = { Text("Постоянный токен (permanent token)") }, singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+                        supportingText = {
+                            Text("Профиль → Аккаунт и безопасность → Токены → Новый токен" +
+                                if (vm.hasToken()) "\n✓ токен сохранён — оставьте поле пустым, чтобы не менять" else "")
+                        })
+                    OutlinedTextField(query, { query = it }, label = { Text("Запрос (синтаксис поиска YouTrack)") },
+                        modifier = Modifier.fillMaxWidth(), supportingText = { Text("например: ${Config.DEFAULT_QUERY}") })
+                    OutlinedTextField(mentionsQuery, { mentionsQuery = it }, label = { Text("Запрос вкладки «Нужно внимание»") },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                        supportingText = { Text("задачи, где вас упомянули через @; пусто — вкладка выключена. По умолчанию: ${Config.DEFAULT_MENTIONS}") })
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp),
+                        maxItemsInEachRow = if (isPhone()) 1 else 2) {
+                        OutlinedTextField(stateField, { stateField = it }, label = { Text("Поле статуса") }, singleLine = true, modifier = Modifier.weight(1f))
+                        OutlinedTextField(prioField, { prioField = it }, label = { Text("Поле приоритета") }, singleLine = true, modifier = Modifier.weight(1f))
+                    }
+                    Text("Если поля называются иначе, виджет сам найдёт статус и приоритет по смыслу.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    NotifySwitch("Оформление текста как в YouTrack", "Описание и комментарии на экране задачи показываются так же, " +
+                        "как в браузере: заголовки, списки, таблицы, код, картинки. Выключено — простой текст.",
+                        vm.config.markdown, true) { vm.setMarkdown(it) }
+                } else if (section == 2) {
+                    LogSection(vm)
+                } else {
+                    val systemOn = NotificationManagerCompat.from(ctx).areNotificationsEnabled()
+                    if (!systemOn) {
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("Уведомления приложения запрещены в Android — ни одно из них не придёт.",
+                                    color = MaterialTheme.colorScheme.onErrorContainer)
+                                TextButton(onClick = { openNotificationSettings(ctx) }, contentPadding = PaddingValues(0.dp)) { Text("Разрешить") }
+                            }
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Уведомления", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Text(if (notify) "Включены — проверка раз в 15 минут, пока есть интернет" else "Все уведомления выключены",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(notify, { notify = it })
+                    }
+                    HorizontalDivider()
+                    Text("События", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    NotifySwitch("Новое упоминание", "Вас отметили через @логин в комментарии к любой задаче",
+                        nMention, notify) { nMention = it }
+                    NotifySwitch("Новый комментарий", "Коллега прокомментировал задачу, где вы исполнитель или наблюдатель",
+                        nComment, notify) { nComment = it }
+                    NotifySwitch("Смена статуса", "У задачи под наблюдением сменился статус (ваши собственные изменения не показываются)",
+                        nStatus, notify) { nStatus = it }
+                    NotifySwitch("Назначена новая задача", "На вас назначили задачу — она появилась в списке «Все»",
+                        nAssigned, notify) { nAssigned = it }
+                    HorizontalDivider()
+                    Text("Задачи под наблюдением", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedTextField(watchQuery, { watchQuery = it }, label = { Text("Запрос задач под наблюдением") },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = notify,
+                        isError = vm.watchError() != null,
+                        supportingText = {
+                            Text((vm.watchError()?.let { "✗ $it\n" } ?: "") +
+                                "По умолчанию: ${Config.DEFAULT_WATCH} — задачи со звёздочкой (вы подписаны). " +
+                                "Если в YouTrack есть поле «Наблюдатели», можно написать: Наблюдатели: me. Пусто — выключено.")
+                        })
+                    HorizontalDivider()
+                    Text("Система", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { test = Notifier.sample(ctx) }) { Text("Проверочное уведомление") }
+                        OutlinedButton(onClick = { openNotificationSettings(ctx) }) { Text("Звук и вид в Android") }
+                        OutlinedButton(onClick = { requestBackgroundWork(ctx) }) { Text("Разрешить работу в фоне") }
+                    }
+                    Text("У каждого типа события свой канал Android — звук, вибрацию и показ на заблокированном экране " +
+                        "можно настроить отдельно.\nБез работы в фоне система может останавливать проверку.\n" +
+                        "OnePlus: «Сведения о приложении → Использование батареи» → включите «Разрешить фоновую активность» и «Автозапуск».\n" +
+                        "Huawei: «Настройки → Батарея → Запуск приложений» → «YouTrack задачи» → «Управлять вручную», включите «Работа в фоне».",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Text("Если поля называются иначе, виджет сам найдёт статус и приоритет по смыслу.",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Уведомления о новых задачах и комментариях", modifier = Modifier.weight(1f))
-                    Switch(notify, { notify = it })
-                }
-                val ctx = LocalContext.current
-                OutlinedButton(onClick = { requestBackgroundWork(ctx) }) { Text("Разрешить работу в фоне") }
-                Text("Без этого система может останавливать проверку новых событий.\n" +
-                    "OnePlus: «Сведения о приложении → Использование батареи» → включите «Разрешить фоновую активность» и «Автозапуск».\n" +
-                    "Huawei: «Настройки → Батарея → Запуск приложений» → «YouTrack задачи» → «Управлять вручную», включите «Работа в фоне».",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (test.isNotEmpty()) {
                     Text(test, color = if (test.startsWith("✓")) Color(0xFF43A047) else Color(0xFFE5484D))
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    OutlinedButton(onClick = {
+                if (section != 2) Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (section == 0) OutlinedButton(onClick = {
                         test = "Проверяю…"
                         scope.launch { test = vm.testConnection(url, token, query) }
                     }) { Text("Проверить") }
                     Button(onClick = {
                         vm.saveSettings(cfg.copy(baseUrl = url, query = query, stateField = stateField.ifBlank { "State" },
-                            priorityField = prioField.ifBlank { "Priority" }, notify = notify, mentionsQuery = mentionsQuery.trim()), token)
-                        if (vm.configured) close() else test = "✗ Укажите адрес и токен"
+                            priorityField = prioField.ifBlank { "Priority" }, notify = notify, mentionsQuery = mentionsQuery.trim(),
+                            watchQuery = watchQuery.trim(), notifyMentions = nMention, notifyComments = nComment,
+                            notifyStatus = nStatus, notifyAssigned = nAssigned), token)
+                        if (vm.configured) close() else { section = 0; test = "✗ Укажите адрес и токен" }
                     }) { Text("Сохранить") }
+                }
+                HorizontalDivider(Modifier.padding(top = 8.dp))
+                Text("Версия приложения: ${appVersion(ctx)}", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+/** Журнал ошибок: последние записи, отправка и очистка. */
+@Composable
+private fun LogSection(vm: MainViewModel) {
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var version by remember { mutableStateOf(0) }  // перечитать после очистки
+    val entries = remember(version) { AppLog.entries(ctx) }
+    Text("Сюда записываются ошибки и падения приложения. Если что-то сломалось — нажмите «Отправить журнал» " +
+        "и перешлите его разработчику (Telegram, почта). Токен и адрес YouTrack в журнал не попадают.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text(AppLog.header(ctx).trim(), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = { runCatching { AppLog.share(ctx) }.onFailure { vm.message = "Не удалось открыть «Поделиться»" } }) {
+            Icon(Icons.Rounded.Share, null, Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Отправить журнал")
+        }
+        OutlinedButton(onClick = {
+            clipboard.setText(AnnotatedString(AppLog.header(ctx) + "\n" + AppLog.read(ctx).takeLast(60_000)))
+        }, enabled = entries.isNotEmpty()) { Text("Копировать") }
+        OutlinedButton(onClick = { AppLog.clear(ctx); version++ }, enabled = entries.isNotEmpty()) { Text("Очистить") }
+    }
+    if (entries.isEmpty()) Text("Ошибок нет", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    else {
+        Text("Записей: ${entries.size}" + if (entries.size > 30) " (показаны последние 30)" else "",
+            style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        entries.take(30).forEach { e ->
+            val crash = e.contains(" CRASH ")
+            Card(colors = CardDefaults.cardColors(containerColor = if (crash) MaterialTheme.colorScheme.errorContainer
+                else MaterialTheme.colorScheme.surfaceContainer), modifier = Modifier.fillMaxWidth()) {
+                SelectionContainer {
+                    Text(e.lineSequence().take(14).joinToString("\n"), style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace, modifier = Modifier.padding(10.dp),
+                        color = if (crash) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface)
                 }
             }
         }
     }
 }
+
+/** Прошлый запуск закончился падением — предложить отправить журнал. */
+@Composable
+private fun CrashDialog(vm: MainViewModel, error: String) {
+    val ctx = LocalContext.current
+    val mdOff = remember { AppLog.markdownAutoOff(ctx) }
+    AlertDialog(
+        onDismissRequest = { vm.dismissCrash() },
+        title = { Text("Приложение аварийно закрылось") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Ошибка записана в журнал. Отправьте его разработчику — так её быстрее исправят.")
+                Text(error, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                if (mdOff) Text("Оформление текста (Markdown) временно выключено, чтобы задачи открывались. " +
+                    "Включить снова: Настройки → Основные.", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { runCatching { AppLog.share(ctx) }; vm.dismissCrash() }) { Text("Отправить журнал") }
+        },
+        dismissButton = { TextButton(onClick = { vm.dismissCrash() }) { Text("Закрыть") } },
+    )
+}
+
+@Composable
+private fun NotifySwitch(title: String, hint: String, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    val alpha = if (enabled) 1f else 0.5f
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface.copy(alpha = alpha))
+            Text(hint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = alpha))
+        }
+        Switch(checked, onChange, enabled = enabled)
+    }
+}
+
+/** Системный экран уведомлений приложения (каналы, звук); на старых версиях — сведения о приложении. */
+private fun openNotificationSettings(ctx: Context) {
+    runCatching {
+        ctx.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName))
+    }.recoverCatching {
+        ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
+    }
+}
+
+/** «1.3.1 (сборка 6)» — из установленного пакета, без BuildConfig. */
+private fun appVersion(ctx: Context): String = runCatching {
+    val p = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
+    val code = if (Build.VERSION.SDK_INT >= 28) p.longVersionCode else @Suppress("DEPRECATION") p.versionCode.toLong()
+    "${p.versionName} (сборка $code)"
+}.getOrDefault("—")
 
 /** Узкий экран (телефон): ширина меньше 600 dp. */
 @Composable

@@ -12,6 +12,10 @@ import java.net.UnknownHostException
 
 class YTException(message: String) : Exception(message)
 
+/** Описание и комментарии, уже оформленные сервером YouTrack (HTML). */
+data class RenderedIssue(val description: String, val comments: List<RenderedComment>)
+data class RenderedComment(val created: Long, val author: String, val html: String)
+
 /** Ограничение длины комментария (как в десктопной версии). */
 const val COMMENT_MAX = 10_000
 
@@ -115,6 +119,33 @@ class YouTrackApi(baseUrl: String, private val token: String) {
             if (it.isNull("description")) "" else it.optString("description")
         }
 
+    /** Описание и комментарии в HTML так, как их показывает сам YouTrack (любая разметка: Markdown, wiki, редактор). */
+    fun rendered(issue: Issue): RenderedIssue {
+        val o = json(get("/api/issues/${issue.id}", mapOf("fields" to
+            "wikifiedDescription,comments(created,deleted,textPreview,author(login,fullName))")))
+        val arr = o.optJSONArray("comments") ?: JSONArray()
+        val comments = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.filter { !it.optBoolean("deleted") }.map {
+            val a = it.optJSONObject("author")
+            RenderedComment(it.optLong("created"), a?.optString("fullName").orEmpty().ifEmpty { a?.optString("login").orEmpty() },
+                if (it.isNull("textPreview")) "" else it.optString("textPreview"))
+        }.sortedBy { it.created }
+        return RenderedIssue(if (o.isNull("wikifiedDescription")) "" else o.optString("wikifiedDescription"), comments)
+    }
+
+    /** Картинка/вложение с сервера YouTrack (с токеном) для встроенного просмотра; чужие адреса — null. */
+    fun resource(address: String): Pair<String, ByteArray>? {
+        val u = runCatching { URL(address) }.getOrNull() ?: return null
+        val b = runCatching { URL(base) }.getOrNull() ?: return null
+        if (u.protocol != b.protocol || u.host != b.host || u.port != b.port) return null  // токен — только своему серверу
+        val c = open(u).apply { setRequestProperty("Accept", "*/*") }
+        return try {
+            if (c.responseCode !in 200..299) null
+            else (c.contentType?.substringBefore(';')?.trim() ?: "application/octet-stream") to c.inputStream.use { it.readBytes() }
+        } finally {
+            c.disconnect()
+        }
+    }
+
     /** Варианты для плашки статуса / приоритета / спринта (см. Model.fieldOptions). */
     fun fieldOptions(issue: Issue, kind: FieldKind): FieldOptions {
         val f = when (kind) {
@@ -140,6 +171,11 @@ class YouTrackApi(baseUrl: String, private val token: String) {
         return runCatching { Model.parseComment(JSONObject(res)) }.getOrNull()?.takeIf { it.created > 0 }
             ?: Comment(System.currentTimeMillis(), "", "", t)
     }
+
+    /** Последние смены полей задачи (новые первыми) — узнать, кто сменил статус. */
+    fun fieldChanges(issue: Issue): List<FieldChange> = Model.parseFieldChanges(
+        get("/api/issues/${issue.id}/activities", mapOf("categories" to "CustomFieldCategory",
+            "fields" to "timestamp,author(login,fullName),field(name),added(name)", "\$reverse" to "true", "\$top" to "30")))
 
     fun applyCommand(issue: Issue, command: String) {
         post("/api/commands", JSONObject().put("query", command)

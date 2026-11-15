@@ -47,6 +47,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** idReadable → описание; null — загружается; значение начинается с «\u0000» — ошибка. */
     val details = mutableStateMapOf<String, String?>()
     var message by mutableStateOf<String?>(null)
+    /** Прошлый запуск завершился падением: текст ошибки для окна «Отправить отчёт». */
+    var crash by mutableStateOf(AppLog.pendingCrash(app)); private set
+
+    fun dismissCrash() {
+        AppLog.clearPendingCrash(getApplication())
+        crash = null
+        config = store.config  // падение могло выключить оформление разметки
+    }
+
+    fun setMarkdown(on: Boolean) {
+        store.config = store.config.copy(markdown = on)
+        config = store.config
+    }
+
+    private fun log(where: String, e: Throwable) = AppLog.error(getApplication(), where, e)
 
     init {
         if (configured) refresh()
@@ -160,7 +175,36 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         openedId = issue.idReadable
         markRead(issue)
         loadDescription(issue)
+        loadRendered(issue, force = true)  // каждый раз свежие комментарии
     }
+
+    /** idReadable → описание и комментарии в оформлении YouTrack; null — загружается; ошибка — нет записи + сообщение в журнале. */
+    val rendered = mutableStateMapOf<String, RenderedIssue?>()
+
+    fun loadRendered(issue: Issue, force: Boolean = false) {
+        val id = issue.idReadable
+        if (!force && id in rendered) return  // уже есть или грузится
+        if (rendered[id] == null) rendered[id] = null  // при обновлении старый текст остаётся на экране
+        renderFailed = renderFailed - id
+        viewModelScope.launch {
+            try {
+                rendered[id] = withContext(Dispatchers.IO) { YouTrackApi(config.baseUrl, store.token).rendered(issue) }
+            } catch (e: Exception) {
+                log("Оформленный текст ${issue.idReadable}", e)
+                if (rendered[id] == null) {
+                    rendered.remove(id)
+                    renderFailed = renderFailed + id
+                }
+            }
+        }
+    }
+
+    /** Задачи, для которых оформленный текст не загрузился — показываем свой разбор разметки. */
+    var renderFailed by mutableStateOf(emptySet<String>()); private set
+
+    /** Картинки и вложения для встроенного просмотра (вызывается из фонового потока WebView). */
+    fun resource(url: String): Pair<String, ByteArray>? =
+        runCatching { YouTrackApi(config.baseUrl, store.token).resource(url) }.getOrNull()
 
     fun closeFull() { openedId = null }
     fun newCount(issue: Issue) = Model.newComments(issue, seen[issue.idReadable], me)
@@ -239,6 +283,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 details[id] = try {
                     withContext(Dispatchers.IO) { YouTrackApi(config.baseUrl, store.token).description(issue) }
                 } catch (e: Exception) {
+                    log("Описание ${issue.idReadable}", e)
                     ERR + (e.message ?: "ошибка")
                 }
             }
@@ -246,8 +291,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------------------------------------------------------------- смена статуса, приоритета, спринта
-    suspend fun fieldOptions(issue: Issue, kind: FieldKind): FieldOptions =
+    suspend fun fieldOptions(issue: Issue, kind: FieldKind): FieldOptions = try {
         withContext(Dispatchers.IO) { YouTrackApi(config.baseUrl, store.token).fieldOptions(issue, kind) }
+    } catch (e: Exception) {
+        log("Варианты поля ${issue.idReadable} (${kind.what})", e)
+        throw e
+    }
 
     fun changeField(issue: Issue, kind: FieldKind, label: String, command: String) {
         viewModelScope.launch {
@@ -256,6 +305,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 message = "✓ ${issue.idReadable}: ${kind.what} → $label"
                 refresh()  // задача могла уйти из списка, если статус её закрывает
             } catch (e: Exception) {
+                log("Смена поля ${issue.idReadable}: $command", e)
                 message = "${issue.idReadable}: не удалось изменить ${kind.what} на «$label». ${e.message}"
             }
         }
@@ -274,9 +324,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val c = withContext(Dispatchers.IO) { YouTrackApi(config.baseUrl, store.token).postComment(issue, text) }
             saveDraft(issue, "")
             commentAdded(issue, c.copy(login = c.login.ifEmpty { me }))
+            loadRendered(issue, force = true)
             message = "${issue.idReadable}: комментарий добавлен"
             null
         } catch (e: Exception) {
+            log("Комментарий ${issue.idReadable}", e)
             "Не отправлено: ${e.message ?: "ошибка"}"
         }
     }
@@ -293,6 +345,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------------- настройки
     fun hasToken() = store.token.isNotBlank()
+    fun watchError(): String? = store.watchError
 
     suspend fun testConnection(url: String, token: String, query: String): String = withContext(Dispatchers.IO) {
         try {
@@ -301,6 +354,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val n = org.json.JSONArray(YouTrackApi(url, t).issuesJson(query, 100)).length()
             "✓ Подключено. Найдено задач по запросу: $n" + if (n >= 100) " (показаны первые 100)" else ""
         } catch (e: Exception) {
+            log("Проверка подключения", e)
             "✗ " + (e.message ?: "ошибка")
         }
     }
@@ -311,6 +365,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val old = store.config
         if (old.baseUrl != c.baseUrl || old.query != c.query) store.resetData()  // иначе «старые» задачи станут новыми
         if (old.mentionsQuery != c.mentionsQuery) store.resetMentions()
+        if (old.watchQuery != c.watchQuery) store.resetWatch()
         store.config = c
         if (newToken.isNotBlank()) store.token = newToken.trim()
         config = c

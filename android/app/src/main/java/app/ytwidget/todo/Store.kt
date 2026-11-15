@@ -23,12 +23,29 @@ data class Config(
     val notify: Boolean = true,
     /** Вкладка «Нужно внимание»: задачи, где вас упомянули; пусто — вкладка выключена. */
     val mentionsQuery: String = DEFAULT_MENTIONS,
+    /** Задачи под наблюдением: уведомления о новых комментариях и смене статуса; пусто — выключено. */
+    val watchQuery: String = DEFAULT_WATCH,
+    val notifyMentions: Boolean = true,
+    val notifyComments: Boolean = true,
+    val notifyStatus: Boolean = true,
+    val notifyAssigned: Boolean = true,
+    /** Оформление Markdown в описании и комментариях; выключается само, если отрисовка разметки уронила приложение. */
+    val markdown: Boolean = true,
 ) {
+    fun allows(kind: NotifyKind) = notify && when (kind) {
+        NotifyKind.MENTION -> notifyMentions
+        NotifyKind.COMMENT -> notifyComments
+        NotifyKind.STATUS -> notifyStatus
+        NotifyKind.ASSIGNED -> notifyAssigned
+    }
+
     val fieldNames get() = FieldNames(state = stateField, priority = priorityField)
 
     companion object {
         const val DEFAULT_QUERY = "Assignee: me #Unresolved sort by: Приоритет"
         const val DEFAULT_MENTIONS = "mentions: me #Unresolved"
+        /** «Звёздочка» в YouTrack = подписка на задачу. Без #Unresolved — чтобы заметить и закрытие задачи. */
+        const val DEFAULT_WATCH = "tag: Star sort by: updated"
     }
 }
 
@@ -46,11 +63,20 @@ class Store(context: Context) {
             maxIssues = p.getInt("maxIssues", 100),
             notify = p.getBoolean("notify", true),
             mentionsQuery = p.getString("mentionsQuery", Config.DEFAULT_MENTIONS).orEmpty(),
+            watchQuery = p.getString("watchQuery", Config.DEFAULT_WATCH).orEmpty(),
+            notifyMentions = p.getBoolean("notifyMentions", true),
+            notifyComments = p.getBoolean("notifyComments", true),
+            notifyStatus = p.getBoolean("notifyStatus", true),
+            notifyAssigned = p.getBoolean("notifyAssigned", true),
+            markdown = p.getBoolean(AppLog.KEY_MARKDOWN, true),
         )
         set(c) = p.edit().putString("baseUrl", c.baseUrl).putString("query", c.query)
             .putString("stateField", c.stateField).putString("priorityField", c.priorityField)
             .putInt("maxIssues", c.maxIssues).putBoolean("notify", c.notify)
-            .putString("mentionsQuery", c.mentionsQuery).apply()
+            .putString("mentionsQuery", c.mentionsQuery).putString("watchQuery", c.watchQuery)
+            .putBoolean("notifyMentions", c.notifyMentions).putBoolean("notifyComments", c.notifyComments)
+            .putBoolean("notifyStatus", c.notifyStatus).putBoolean("notifyAssigned", c.notifyAssigned)
+            .putBoolean(AppLog.KEY_MARKDOWN, c.markdown).apply()
 
     var token: String
         get() = p.getString("token", null)?.let { runCatching { decrypt(it) }.getOrNull() }.orEmpty()
@@ -160,12 +186,33 @@ class Store(context: Context) {
 
     fun issues(): List<Issue> = issuesJson?.let { runCatching { Model.parseIssues(it, config.fieldNames) }.getOrNull() } ?: emptyList()
 
+    /** Задачи под наблюдением: статус и время последнего комментария на момент прошлой проверки. */
+    var watchState: WatchState?
+        get() = p.getString("watchState", null)?.let { s ->
+            runCatching {
+                val o = JSONObject(s)
+                val st = o.getJSONObject("states")
+                val cm = o.getJSONObject("comments")
+                WatchState(st.keys().asSequence().associateWith { st.optString(it) }, cm.keys().asSequence().associateWith { cm.optLong(it) })
+            }.getOrNull()
+        }
+        set(v) = p.edit().putString("watchState", v?.let {
+            JSONObject().put("states", JSONObject(it.states as Map<*, *>)).put("comments", JSONObject(it.comments as Map<*, *>)).toString()
+        }).apply()
+
+    /** Ошибка запроса наблюдения (основной список при этом работает) — показываем в настройках. */
+    var watchError: String?
+        get() = p.getString("watchError", null)
+        set(v) = p.edit().putString("watchError", v).apply()
+
+    fun resetWatch() { p.edit().remove("watchState").remove("watchError").apply() }
+
     fun resetMentions() { p.edit().remove("mentionsJson").remove("mentionSeen").apply() }
 
     /** Смена адреса/запроса — сбросить кэш и состояние уведомлений, чтобы «старые» задачи не считались новыми. */
     fun resetData() {
         p.edit().remove("issuesJson").remove("notifyState").remove("lastOk").remove("lastError").remove("me")
-            .remove("mentionsJson").remove("mentionSeen").apply()
+            .remove("mentionsJson").remove("mentionSeen").remove("watchState").remove("watchError").apply()
     }
 
     // ---------------------------------------------------------------- шифрование токена
