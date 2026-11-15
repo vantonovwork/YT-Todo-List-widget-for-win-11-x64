@@ -1,0 +1,17 @@
+# Gradle и Android Studio
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.kotlin/
+
+# Ключи подписи — никогда в репозиторий
+*.jks
+*.keystore
+keystore.properties
+
+# Готовые APK (выкладываются в Releases)
+dist/

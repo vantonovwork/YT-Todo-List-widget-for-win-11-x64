@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Значок уведомлений: «YT» одним цветом (система перекрашивает его сама) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M3,5.2 L7.3,11.4 L11.6,5.2 M7.3,11.4 L7.3,18.8 M12.6,5.6 L21,5.6 M16.8,5.6 L16.8,18.8"
+        android:strokeWidth="3.1"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

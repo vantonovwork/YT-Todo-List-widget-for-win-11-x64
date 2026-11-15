@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Белые буквы «YT» (те же отрезки, что в make_icon.py, вписаны в безопасную зону 66dp) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M33.6,36.4 L44.3,51.9 L55.0,36.4 M44.3,51.9 L44.3,70.4 M57.4,37.6 L78.2,37.6 M67.8,37.6 L67.8,70.4"
+        android:strokeWidth="8.9"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
