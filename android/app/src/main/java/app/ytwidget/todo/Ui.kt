@@ -112,6 +112,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.material.icons.rounded.BugReport
@@ -313,26 +316,65 @@ private fun UrgentCard(u: UrgentTask, onToggle: () -> Unit, onEdit: () -> Unit, 
 /** Создание/изменение срочной задачи: название до 100 символов, текст до 1000 (со счётчиками). */
 @Composable
 private fun UrgentEditor(u: UrgentTask, onDismiss: () -> Unit, onSave: (String, String) -> Unit) {
-    var title by rememberSaveable(u.id) { mutableStateOf(u.title) }
-    var text by rememberSaveable(u.id) { mutableStateOf(u.text) }
+    // TextFieldValue — чтобы знать позицию курсора для кнопки «Вставить»
+    var title by rememberSaveable(u.id, stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue(u.title)) }
+    var text by rememberSaveable(u.id, stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue(u.text)) }
+    var note by remember { mutableStateOf<String?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (u.id.isEmpty()) "Новая срочная задача" else "Изменить срочную задачу") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(title, { title = it.replace("\n", " ").take(Urgent.TITLE_MAX) }, label = { Text("Название") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth(),
-                    supportingText = { Counter(title.length, Urgent.TITLE_MAX, 10) })
-                OutlinedTextField(text, { text = it.take(Urgent.TEXT_MAX) }, label = { Text("Текст (необязательно)") },
+                OutlinedTextField(title, { title = limited(it, Urgent.TITLE_MAX, singleLine = true); note = null },
+                    label = { Text("Название") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { PasteButton(title, Urgent.TITLE_MAX, singleLine = true, { title = it }, { note = it }) },
+                    supportingText = { Counter(title.text.length, Urgent.TITLE_MAX, 10) })
+                OutlinedTextField(text, { text = limited(it, Urgent.TEXT_MAX); note = null }, label = { Text("Текст (необязательно)") },
                     minLines = 4, maxLines = 10, modifier = Modifier.fillMaxWidth(),
-                    supportingText = { Counter(text.length, Urgent.TEXT_MAX, 50) })
+                    trailingIcon = { PasteButton(text, Urgent.TEXT_MAX, singleLine = false, { text = it }, { note = it }) },
+                    supportingText = { Counter(text.text.length, Urgent.TEXT_MAX, 50) })
+                note?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
                 Text("Хранится только на этом устройстве, в YouTrack не отправляется.",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         },
-        confirmButton = { TextButton(onClick = { onSave(title, text) }, enabled = title.isNotBlank()) { Text("Сохранить") } },
+        confirmButton = { TextButton(onClick = { onSave(title.text, text.text) }, enabled = title.text.isNotBlank()) { Text("Сохранить") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
+}
+
+/** Ввод с клавиатуры и системная вставка: обрезка по лимиту, курсор не выходит за текст. */
+private fun limited(v: TextFieldValue, max: Int, singleLine: Boolean = false): TextFieldValue {
+    val t = (if (singleLine) v.text.replace("\r\n", " ").replace('\n', ' ').replace('\r', ' ') else v.text).take(max)
+    if (t == v.text) return v
+    return v.copy(text = t, selection = TextRange(v.selection.start.coerceAtMost(t.length), v.selection.end.coerceAtMost(t.length)))
+}
+
+/**
+ * Кнопка «Вставить из буфера обмена» в поле ввода. Нужна потому, что в диалогах на части устройств
+ * (Huawei/HarmonyOS и др.) по долгому нажатию не появляется панель с «Вставить».
+ */
+@Composable
+private fun PasteButton(value: TextFieldValue, max: Int, singleLine: Boolean, onChange: (TextFieldValue) -> Unit,
+                        onNote: (String) -> Unit, enabled: Boolean = true) {
+    val clipboard = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    IconButton(enabled = enabled, onClick = {
+        val clip = try {
+            clipboard.getText()?.text
+        } catch (e: Exception) {
+            AppLog.error(ctx, "Чтение буфера обмена", e)
+            null
+        }
+        val r = Paste.into(value.text, value.selection.start, value.selection.end, clip, max, singleLine)
+        when {
+            r == null -> onNote("В буфере обмена нет текста")
+            else -> {
+                onChange(TextFieldValue(r.value, TextRange(r.cursor)))
+                onNote(if (r.cut) "Вставлено не всё: ограничение $max символов" else "")
+            }
+        }
+    }) { Icon(Icons.Rounded.ContentPaste, "Вставить из буфера обмена") }
 }
 
 @Composable
@@ -781,9 +823,13 @@ private fun MentionBlock(vm: MainViewModel, issue: Issue) {
 /** Новый комментарий. Закрытие — текст сохраняется как черновик; ошибка отправки — текст не теряется. */
 @Composable
 private fun CommentEditor(vm: MainViewModel, issue: Issue) {
-    var text by rememberSaveable(issue.idReadable) { mutableStateOf(vm.drafts[issue.idReadable].orEmpty()) }
+    var field by rememberSaveable(issue.idReadable, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(vm.drafts[issue.idReadable].orEmpty()))
+    }
+    val text = field.text
     var sending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var note by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     val close = { vm.saveDraft(issue, text); vm.commentFor = null }
     AlertDialog(
@@ -793,8 +839,11 @@ private fun CommentEditor(vm: MainViewModel, issue: Issue) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(issue.summary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, maxLines = 3,
                     overflow = TextOverflow.Ellipsis)
-                OutlinedTextField(text, { text = it.take(COMMENT_MAX); error = null }, placeholder = { Text("Текст комментария") },
-                    minLines = 5, maxLines = 12, enabled = !sending, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(field, { field = limited(it, COMMENT_MAX); error = null; note = "" },
+                    placeholder = { Text("Текст комментария") },
+                    minLines = 5, maxLines = 12, enabled = !sending, modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { PasteButton(field, COMMENT_MAX, singleLine = false, { field = it; error = null }, { note = it }, !sending) })
+                if (note.isNotEmpty()) Text(note, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 error?.let { Text(it, color = Color(0xFFE5484D), style = MaterialTheme.typography.bodySmall) }
                 Text("Поддерживается разметка YouTrack, @логин — упомянуть коллегу. При закрытии текст сохранится как черновик.",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

@@ -87,6 +87,26 @@ data class UrgentTask(
     val doneAt: Long = 0L,
 )
 
+/** Результат вставки из буфера: новый текст, позиция курсора, обрезано ли по лимиту. */
+data class Pasted(val value: String, val cursor: Int, val cut: Boolean)
+
+/** Вставка текста из буфера обмена в позицию курсора (заменяет выделение) с лимитом длины. */
+object Paste {
+    /** null — в буфере нет текста. singleLine — переводы строк превращаются в пробелы (название срочной задачи). */
+    fun into(text: String, selStart: Int, selEnd: Int, clip: String?, max: Int, singleLine: Boolean): Pasted? {
+        var c = (clip ?: return null).replace("\r\n", "\n").replace('\r', '\n')
+        if (singleLine) c = c.replace(Regex("[ \\t]*\\n+[ \\t]*"), " ").trim()
+        if (c.isEmpty()) return null
+        val s = minOf(selStart, selEnd).coerceIn(0, text.length)
+        val e = maxOf(selStart, selEnd).coerceIn(0, text.length)
+        val room = max - (text.length - (e - s))
+        if (room <= 0) return Pasted(text, e, true)
+        var piece = c.take(room)
+        if (piece.length < c.length && piece.isNotEmpty() && piece.last().isHighSurrogate()) piece = piece.dropLast(1)  // не резать эмодзи
+        return Pasted(text.substring(0, s) + piece + text.substring(e), s + piece.length, piece.length < c.length)
+    }
+}
+
 object Urgent {
     const val TITLE_MAX = 100
     const val TEXT_MAX = 1000
