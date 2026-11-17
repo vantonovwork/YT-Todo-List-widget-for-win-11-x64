@@ -1265,6 +1265,30 @@ class TestDayGroups(Base):
         self.assertEqual(len(app.plan_groups), 2)
 
 
+class TestResizeGrip(Base):
+    """Уголок ресайза виден в окне любой высоты, и им можно растянуть окно из минимального размера."""
+
+    def grip_visible(self, app):
+        app.update()
+        g = app.grip
+        return g.winfo_ismapped() and g.winfo_rooty() + g.winfo_height() <= app.winfo_rooty() + app.winfo_height() + 1 \
+            and g.winfo_height() >= 10
+
+    def test_grip_at_min_height_and_resize(self):
+        app = self.make_app(geometry=f"515x{w.MIN_H}+60+60")
+        self.assertEqual(app.winfo_height(), w.MIN_H)
+        self.assertTrue(self.grip_visible(app), "уголок ресайза виден в окне минимальной высоты")
+        ev = Ev(0, 0)
+        ev.x_root, ev.y_root = 500, 500
+        app._resize_start(ev)
+        ev.x_root, ev.y_root = 560, 800
+        app._resize_move(ev)
+        pump(app, 0.3)
+        self.assertEqual((app.winfo_width(), app.winfo_height()), (575, w.MIN_H + 300))
+        self.assertTrue(self.grip_visible(app))
+        self.assertGreater(app.canvas.winfo_height(), 250, "список занял освободившееся место")
+
+
 class TestCollapse(Base):
     def test_header_collapse_and_expand(self):
         app = self.make_app()

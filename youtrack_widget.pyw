@@ -1623,7 +1623,8 @@ class Widget(tk.Tk):
         list_wrap.pack(fill="both", expand=True, padx=(10, 2))
         # Весь список рисуется на ОДНОМ холсте (карточка = фигуры и текст, а не десяток виджетов):
         # так ресайз и прокрутка не пересчитывают сотни вложенных фреймов.
-        self.canvas = tk.Canvas(list_wrap, bg=BG, highlightthickness=0, bd=0, yscrollincrement=1)
+        # height=1: холст не просит места сам — иначе в низком окне он вытесняет нижнюю панель с уголком ресайза
+        self.canvas = tk.Canvas(list_wrap, bg=BG, highlightthickness=0, bd=0, yscrollincrement=1, height=1)
         self.scroll = tk.Scrollbar(list_wrap, orient="vertical", command=self.canvas.yview, width=10)
         self.canvas.configure(yscrollcommand=self.scroll.set)
         self.scroll.pack(side="right", fill="y")
@@ -1650,10 +1651,12 @@ class Widget(tk.Tk):
         self.search_var.trace_add("write", lambda *a: self._schedule_filter())
 
         footer = tk.Frame(self.body, bg=BG)
-        footer.pack(fill="x", side="bottom")
+        # упаковываем до списка: при нехватке места Tk сжимает последние упакованные виджеты,
+        # и уголок ресайза должен оставаться видимым даже в окне минимальной высоты
+        footer.pack(fill="x", side="bottom", before=list_wrap)
         self.status_lbl = tk.Label(footer, text="", bg=BG, fg=BG_SUB, font=(FONT, 8), anchor="w")
         self.status_lbl.pack(side="left", fill="x", expand=True, padx=12, pady=4)
-        grip = tk.Label(footer, text="◢", bg=BG, fg=BG_SUB, font=(FONT, 9), cursor="size_nw_se")
+        grip = self.grip = tk.Label(footer, text="◢", bg=BG, fg=BG_SUB, font=(FONT, 9), cursor="size_nw_se")
         grip.pack(side="right", padx=(0, 3))
         grip.bind("<ButtonPress-1>", self._resize_start)
         grip.bind("<B1-Motion>", self._resize_move)
