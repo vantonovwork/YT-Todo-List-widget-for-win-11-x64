@@ -155,6 +155,97 @@ object Urgent {
 /** Что уже показано в уведомлениях: время последнего комментария по задаче + задачи прошлой загрузки. */
 data class NotifyState(val notified: Map<String, Long>, val known: Set<String>)
 
+/** Блок плана на день («Требуется уточнение», «Анализ»…). */
+data class PlanGroup(val id: String, val name: String)
+
+/** Блоки плана на день — как plan.json (groups / group_of) на десктопе. */
+object PlanGroups {
+    const val NAME_MAX = 40
+    val DEFAULT = listOf(PlanGroup("main", "Задачи на день"))
+
+    fun parse(json: String?): List<PlanGroup> {
+        if (json.isNullOrBlank()) return DEFAULT
+        val list = runCatching {
+            val a = JSONArray(json)
+            (0 until a.length()).mapNotNull { a.optJSONObject(it) }.mapNotNull { o ->
+                val id = o.optString("id")
+                val name = o.optString("name").trim().take(NAME_MAX)
+                if (id.isEmpty() || name.isEmpty()) null else PlanGroup(id, name)
+            }.distinctBy { it.id }
+        }.getOrDefault(emptyList())
+        return list.ifEmpty { DEFAULT }
+    }
+
+    fun toJson(list: List<PlanGroup>): String =
+        JSONArray(list.map { JSONObject().put("id", it.id).put("name", it.name) }).toString()
+
+    fun parseOf(json: String?): Map<String, String> = runCatching {
+        val o = JSONObject(json ?: return emptyMap())
+        o.keys().asSequence().associateWith { o.optString(it) }.filterValues { it.isNotEmpty() }
+    }.getOrDefault(emptyMap())
+
+    fun ofToJson(m: Map<String, String>): String = JSONObject(m as Map<*, *>).toString()
+
+    /** Блок задачи; без блока или из удалённого блока — первый. */
+    fun groupOf(id: String, groups: List<PlanGroup>, of: Map<String, String>): String =
+        of[id]?.takeIf { g -> groups.any { it.id == g } } ?: groups.first().id
+
+    /** Новый список блоков из редактора: пустые названия отброшены, задачи удалённых блоков — в первый блок. */
+    fun normalize(groups: List<PlanGroup>, of: Map<String, String>): Pair<List<PlanGroup>, Map<String, String>> {
+        val list = groups.map { it.copy(name = it.name.trim().take(NAME_MAX)) }.filter { it.name.isNotEmpty() }.ifEmpty { DEFAULT }
+        val ids = list.map { it.id }.toSet()
+        return list to of.filterValues { it in ids }
+    }
+
+    /** Ошибка в списке названий из редактора или null, если можно сохранять. */
+    fun validate(names: List<String>): String? {
+        val n = names.map { it.trim() }.filter { it.isNotEmpty() }
+        return when {
+            n.isEmpty() -> "Нужен хотя бы один блок с названием"
+            n.map { it.lowercase() }.toSet().size != n.size -> "Названия блоков не должны повторяться"
+            else -> null
+        }
+    }
+
+    /**
+     * Перетаскивание: задачу [moved] положить в блок [gid] перед задачей [before] (null — в конец блока).
+     * [order] — текущий порядок на вкладке «День». Возвращает новый порядок и распределение по блокам.
+     */
+    fun drop(order: List<String>, groups: List<PlanGroup>, of: Map<String, String>, moved: String, gid: String,
+             before: String?): Pair<List<String>, Map<String, String>> {
+        val newOf = of + (moved to gid)
+        val rest = order.filter { it != moved }.toMutableList()
+        val pos = when {
+            before != null && before != moved && before in rest -> rest.indexOf(before)
+            before == moved && moved in order -> order.indexOf(moved)
+            else -> rest.indexOfLast { groupOf(it, groups, of) == gid }.let { if (it >= 0) it + 1 else rest.size }
+        }
+        rest.add(pos, moved)
+        return rest to newOf
+    }
+
+    /** ↑/↓: внутри блока — поменять с соседом, на границе — в конец предыдущего / начало следующего блока. null — некуда. */
+    fun step(order: List<String>, groups: List<PlanGroup>, of: Map<String, String>, id: String, delta: Int): Pair<List<String>, Map<String, String>>? {
+        val k = order.indexOf(id)
+        if (k < 0) return null
+        val mine = groupOf(id, groups, of)
+        val j = k + delta
+        if (j in order.indices && groupOf(order[j], groups, of) == mine) {
+            val ids = order.toMutableList()
+            ids[k] = order[j]; ids[j] = id
+            return ids to of
+        }
+        val gi = groups.indexOfFirst { it.id == mine } + delta
+        if (gi !in groups.indices) return null
+        val target = groups[gi].id
+        val ids = order.filter { it != id }.toMutableList()
+        val same = ids.indices.filter { groupOf(ids[it], groups, of) == target }
+        val pos = if (same.isEmpty()) ids.size else if (delta < 0) same.last() + 1 else same.first()
+        ids.add(pos, id)
+        return ids to (of + (id to target))
+    }
+}
+
 object Model {
     const val ISSUE_FIELDS = "id,idReadable,summary," +
         "customFields(id,name,\$type,value(name,fullName,login,archived,released,releaseDate," +
@@ -527,10 +618,13 @@ object Model {
         is Event.NewIssue -> NotifyKind.ASSIGNED
     }
 
-    /** Порядок плана на день: как расставил пользователь, выполненные — в конце. */
-    fun planOrder(issues: List<Issue>, plan: List<String>, done: Set<String>): List<Issue> {
+    /** Порядок плана на день: по блокам, внутри блока — как расставил пользователь, выполненные — в конце блока. */
+    fun planOrder(issues: List<Issue>, plan: List<String>, done: Set<String>,
+                  groups: List<PlanGroup> = PlanGroups.DEFAULT, groupOf: Map<String, String> = emptyMap()): List<Issue> {
         val pos = plan.withIndex().associate { it.value to it.index }
+        val gpos = groups.withIndex().associate { it.value.id to it.index }
         return issues.filter { it.idReadable in pos }
-            .sortedWith(compareBy<Issue> { it.idReadable in done }.thenBy { pos[it.idReadable] ?: 0 })
+            .sortedWith(compareBy<Issue> { gpos[PlanGroups.groupOf(it.idReadable, groups, groupOf)] ?: 0 }
+                .thenBy { it.idReadable in done }.thenBy { pos[it.idReadable] ?: 0 })
     }
 }

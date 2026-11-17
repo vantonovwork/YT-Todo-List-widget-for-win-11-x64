@@ -34,7 +34,7 @@ class Base(unittest.TestCase):
 
     def setUp(self):
         mock.control(self.base, "/test/reset")
-        for p in (w.PLAN_PATH, w.SEEN_PATH, w.URGENT_PATH, w.ATTN_PATH):
+        for p in (w.PLAN_PATH, w.SEEN_PATH, w.URGENT_PATH, w.ATTN_PATH, w.LOG_PATH):
             if os.path.exists(p):
                 os.remove(p)
         self.toasts, self.boxes, self.opened = [], [], []
@@ -236,13 +236,15 @@ class TestQuickViewAndComments(Base):
         self.assertEqual(app.count_lbl.cget("text"), "1 нов.")
         self.click(app, "i0")
         self.assertIn("OE-1", app.expanded)
-        wait_for(app, lambda: isinstance(app.details.get("OE-1"), str), what="описание")
-        pump(app, 0.1)
+        wait_for(app, lambda: isinstance(app.details.get("OE-1"), dict), what="содержимое задачи")
+        pump(app, 0.3)
+        body = self.detail_text(app, "OE-1")
+        self.assertIn("Нужно обновить выгрузку", body)
+        self.assertIn("код", body)
+        self.assertIn("Илья Гаврилов", body)
         texts = "\n".join(self.texts(app, "c0"))
-        self.assertIn("Нужно обновить выгрузку", texts)
-        self.assertIn("[код]", texts)
-        self.assertIn("Илья Гаврилов", texts)
         self.assertIn("Открыть в YouTrack", texts)
+        self.assertNotIn("Полностью", texts, "отдельной кнопки «Полностью» нет")
         self.assertEqual(app.count_lbl.cget("text"), "", "просмотр помечает комментарии прочитанными")
         self.click(app, "o0")
         self.assertEqual(self.opened[-1], f"{self.base}/issue/OE-1")
@@ -253,7 +255,7 @@ class TestQuickViewAndComments(Base):
         app = self.make_app()
         # ссылка «Написать комментарий» в быстром просмотре OE-2
         self.click(app, "i1")
-        wait_for(app, lambda: isinstance(app.details.get("OE-2"), str), what="описание")
+        wait_for(app, lambda: isinstance(app.details.get("OE-2"), dict), what="содержимое задачи")
         pump(app, 0.1)
         self.assertIn("Написать комментарий", "\n".join(self.texts(app, "c1")))
         self.click(app, "m1")
@@ -284,9 +286,8 @@ class TestQuickViewAndComments(Base):
         wait_for(app, lambda: not win.winfo_exists(), what="окно закрылось после отправки")
         self.assertEqual(mock.State.commands[-1], {"comment": "Проверил, всё ок", "issue": "OE-2"})
         self.assertIn("комментарий добавлен", app.status_lbl.cget("text"))
-        pump(app, 0.2)
-        texts = "\n".join(self.texts(app, "c1"))
-        self.assertIn("Проверил, всё ок", texts, "новый комментарий сразу виден в карточке")
+        wait_for(app, lambda: "Проверил, всё ок" in self.detail_text(app, "OE-2"),
+                 what="новый комментарий виден в раскрытой карточке")
         self.assertEqual(app.new_comments(self.card(app, "OE-2")["issue"]), 0, "свой комментарий не «новый»")
         # после обновления списка — без уведомления о своём же комментарии
         app.refresh()
@@ -298,10 +299,14 @@ class TestQuickViewAndComments(Base):
                   if app.menu.type(i) not in ("separator",)]
         self.assertIn("Написать комментарий…", labels)
 
+    def detail_text(self, app, iid):
+        cache = app._detail_cache.get(iid)
+        return cache["widget"].get("1.0", "end-1c") if cache and cache["widget"].winfo_exists() else ""
+
     def test_title_click_opens_and_marks_read(self):
         w.save_seen({"OE-1": 0})
         app = self.make_app()
-        self.click(app, "t0")
+        app.open_issue(self.card(app, "OE-1")["issue"])  # «Открыть в YouTrack»
         self.assertEqual(self.opened, [f"{self.base}/issue/OE-1"])
         self.assertEqual(app.new_comments(self.card(app, "OE-1")["issue"]), 0)
         self.assertGreater(w.load_seen()["OE-1"], 0)
@@ -412,7 +417,7 @@ class TestNotifications(Base):
         mock.control(self.base, "/test/new-issue")
         self.refresh(app)
         titles = [t[0] for t in self.toasts]
-        self.assertEqual(titles, ["Комментарий · OE-2", "Новая задача · OE-9"])
+        self.assertEqual(titles, ["Комментарий · OE-2", "Назначена задача · OE-9"])
         self.assertEqual(self.toasts[0][1], "Илья Гаврилов: Нужна проверка на тесте, см. лог")
         self.assertEqual(self.toasts[0][2], f"{self.base}/issue/OE-2")
         self.refresh(app)
@@ -420,7 +425,7 @@ class TestNotifications(Base):
         mock.control(self.base, "/test/many-comments")
         self.refresh(app)
         self.assertEqual(len(self.toasts), 3)
-        self.assertIn("новых комментариев: 5", self.toasts[-1][0], "много событий — одно сводное уведомление")
+        self.assertEqual(self.toasts[-1][0], "YouTrack: комментариев: 5", "много событий — одно сводное уведомление")
 
     def test_disabled(self):
         app = self.make_app(notify=False)
@@ -908,6 +913,356 @@ class TestClipboard(Base):
         win._save()
         pump(app, 0.1)
         self.assertEqual(len(app.urgent), 1, "задача со вставленным текстом сохраняется")
+
+
+class TestInlineDetails(Base):
+    """Клик по облачку: в карточке всё описание и все комментарии с оформлением (без отдельного окна)."""
+
+    def widget(self, app, iid):
+        cache = app._detail_cache.get(iid)
+        return cache["widget"] if cache and cache["widget"].winfo_exists() else None
+
+    def open_card(self, app, iid="OE-1"):
+        idx = self.ids(app).index(iid)
+        self.click(app, f"i{idx}")
+        wait_for(app, lambda: self.widget(app, iid) is not None and self.widget(app, iid).winfo_ismapped(),
+                 what="содержимое в карточке")
+        pump(app, 0.4)
+        return self.widget(app, iid)
+
+    def test_markup_all_comments_and_height(self):
+        mock.State.issues[0]["comments"] += [mock.cm(1100 + k, text=f"Комментарий номер {k}") for k in range(5)]
+        app = self.make_app()
+        t = self.open_card(app)
+        body = t.get("1.0", "end-1c")
+        self.assertIn("Нужно обновить выгрузку", body, "**жирный** без звёздочек")
+        self.assertNotIn("**", body)
+        self.assertIn("Комментарии (6)", body, "все комментарии, а не три")
+        self.assertLess(body.index("Комментарий номер 4"), body.index("Комментарий номер 0"), "новые сверху")
+        for tag in ("b", "pre", "link"):
+            self.assertTrue(t.tag_ranges(tag), tag)
+        self.assertEqual(str(t.cget("state")), "disabled", "только чтение — выделять и копировать можно")
+        # каждый комментарий — в своём «облачке»: 6 отдельных блоков с фоном, описание вне облачков
+        ranges = t.tag_ranges("bubble")
+        self.assertEqual(len(ranges) // 2, 6, "облачка не сливаются")
+        first = t.get(ranges[0], ranges[1])
+        self.assertIn("Комментарий номер 4", first)
+        self.assertNotIn("Комментарий номер 3", first)
+        self.assertNotIn("bubble", t.tag_names(t.search("Нужно", "1.0")), "описание не в облачке")
+        # высота поля подогнана под содержимое: внизу ничего не обрезано
+        cv = app.canvas
+        item = cv.find_withtag("d0")[0]
+        h = int(float(cv.itemcget(item, "height")))
+        res = t.count("1.0", "end", "update", "ypixels")
+        need = res[0] if isinstance(res, tuple) else res
+        self.assertGreaterEqual(h, need)
+        self.assertLess(h - need, 30)
+        # ссылки «Написать комментарий» и «Открыть в YouTrack» — под содержимым
+        link_top = cv.bbox(cv.find_withtag("o0")[0])[1]
+        self.assertGreater(link_top, cv.bbox(item)[3] - 1)
+        self.assertNotIn("Полностью", "\n".join(self.texts(app, "c0")))
+
+    def test_resize_refits_and_title_opens_browser(self):
+        app = self.make_app()
+        t = self.open_card(app)
+        cv = app.canvas
+        h1 = int(float(cv.itemcget(cv.find_withtag("d0")[0], "height")))
+        app.geometry("360x700")
+        pump(app, 0.8)
+        h2 = int(float(cv.itemcget(cv.find_withtag("d0")[0], "height")))
+        self.assertGreater(h2, h1, "в узком окне текст переносится — поле выше")
+        self.assertTrue(t.winfo_ismapped())
+        self.click(app, "t0")
+        self.assertEqual(self.opened, [f"{self.base}/issue/OE-1"], "название открывает задачу в браузере")
+        # свернуть — поле убирается
+        self.click(app, "i0")
+        pump(app, 0.2)
+        self.assertFalse(cv.find_withtag("d0"))
+
+    def test_markdown_off_and_error(self):
+        app = self.make_app(markdown=False)
+        t = self.open_card(app)
+        self.assertIn("**обновить**", t.get("1.0", "end-1c"), "без оформления — текст как есть")
+        app.details.pop("OE-2", None)
+        mock.control(self.base, "/test/mode?m=500")
+        idx = self.ids(app).index("OE-2")
+        self.click(app, f"i{idx}")
+        wait_for(app, lambda: isinstance(app.details.get("OE-2"), Exception), what="ошибка загрузки")
+        pump(app, 0.2)
+        self.assertTrue(any("Не удалось загрузить" in x for x in self.texts(app, f"c{self.ids(app).index('OE-2')}")))
+        self.assertTrue(any("содержимое задачи" in e for e in w.log_entries()), "ошибка записана в журнал")
+
+    def test_theme_rebuild_keeps_details(self):
+        app = self.make_app()
+        self.open_card(app)
+        w.apply_theme("#eef0f3", "#ffffff", 12)
+        app.rebuild()
+        wait_for(app, lambda: self.widget(app, "OE-1") is not None and self.widget(app, "OE-1").winfo_ismapped(),
+                 what="содержимое после смены темы")
+        self.assertEqual(self.widget(app, "OE-1").cget("bg"), "#ffffff")
+        w.apply_theme("#1f1f1f", "#2b2b2b", 12)
+
+
+class TestWatchedNotifications(Base):
+    """Задачи под наблюдением и уведомления по видам (как в Android-версии)."""
+
+    def refresh(self, app):
+        app.refresh()
+        wait_for(app, lambda: not app.loading, what="обновление")
+        pump(app, 0.4)  # автор смены статуса загружается в фоне
+
+    def test_status_change_by_colleague_and_own(self):
+        app = self.make_app()
+        self.assertEqual(self.toasts, [])
+        mock.control(self.base, "/test/watch-status")
+        self.refresh(app)
+        wait_for(app, lambda: self.toasts, what="уведомление о смене статуса")
+        self.assertEqual(self.toasts[-1][:2], ("Статус: В разработке · WI-1", "Павел Драничников: Анализ → В разработке"))
+        mock.control(self.base, "/test/watch-status-mine")
+        self.refresh(app)
+        pump(app, 0.5)
+        self.assertEqual(len(self.toasts), 1, "о своей смене статуса не уведомляем")
+
+    def test_watched_comment_and_kind_switches(self):
+        app = self.make_app(notify_comments=False)
+        mock.control(self.base, "/test/watch-comment")
+        self.refresh(app)
+        self.assertEqual(self.toasts, [], "комментарии выключены отдельным переключателем")
+        app.cfg["notify_comments"] = True
+        mock.control(self.base, "/test/watch-comment")
+        self.refresh(app)
+        self.assertEqual([t[0] for t in self.toasts], ["Комментарий · WI-1"])
+        app.cfg["notify_status"] = False
+        mock.control(self.base, "/test/watch-status")
+        self.refresh(app)
+        pump(app, 0.4)
+        self.assertEqual(len(self.toasts), 1, "смена статуса выключена")
+
+    def test_watch_query_error_logged_and_main_list_ok(self):
+        app = self.make_app(watch_query="")
+        self.assertEqual(len(app.cards), 6)
+        self.assertNotIn("tag: Star", " ".join(mock.State.requests), "пустой запрос — наблюдение выключено")
+
+
+class TestLogAndPlanMenu(Base):
+    def setUp(self):
+        super().setUp()
+        self._popup = w.tk.Menu.tk_popup
+        w.tk.Menu.tk_popup = lambda *a, **k: None
+        self.addCleanup(setattr, w.tk.Menu, "tk_popup", self._popup)
+        if os.path.exists(w.LOG_PATH):
+            os.remove(w.LOG_PATH)
+
+    def test_ui_error_logged_and_journal_window(self):
+        app = self.make_app()
+        del app.report_callback_exception  # настоящий обработчик виджета, а не перехват тестов
+        try:
+            raise ValueError("тестовая ошибка с токеном perm:SECRET123 и адресом https://x.example/api")
+        except ValueError as ex:
+            app.report_callback_exception(ValueError, ex, ex.__traceback__)
+        self.assertIn("журнал", app.status_lbl.cget("text"))
+        entries = w.log_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertIn("ERROR · интерфейс · " + w.VERSION, entries[0])
+        self.assertNotIn("SECRET123", entries[0], "токен в журнал не попадает")
+        self.assertNotIn("x.example", entries[0], "адрес в журнал не попадает")
+        app.open_log_window()
+        text = app._log_win._text.get("1.0", "end-1c")
+        self.assertIn("YouTrack Widget " + w.VERSION, text)
+        self.assertIn("тестовая ошибка", text)
+        app._log_win.destroy()
+
+    def test_crash_prompt_and_send(self):
+        desk = os.path.join(os.environ["APPDATA"], "desk")
+        os.makedirs(desk, exist_ok=True)
+        popen = w.subprocess.Popen
+        w.subprocess.Popen = lambda *a, **k: None  # не открывать Проводник
+        self.addCleanup(setattr, w.subprocess, "Popen", popen)
+        w.log_event("CRASH", "приложение", "RuntimeError: упало")
+        app = self.make_app(crash_pending="RuntimeError: упало")
+        app._desktop_dir = lambda: desk
+        app._offer_crash_report()
+        files = os.listdir(desk)
+        self.assertEqual(len(files), 1, "журнал сохранён для отправки")
+        with open(os.path.join(desk, files[0]), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("CRASH · приложение", report)
+        self.assertNotIn("crash_pending", w.load_cfg(), "предложение показывается один раз")
+
+    def test_log_trim(self):
+        os.makedirs(w.CFG_DIR, exist_ok=True)
+        for k in range(1200):
+            w.log_event("WARN", "тест", "x" * 300 + f" запись {k}")
+        self.assertLessEqual(os.path.getsize(w.LOG_PATH), w.LOG_MAX + 1000)
+        self.assertTrue(w.log_entries()[0].endswith("запись 1199"), "новые записи сохраняются")
+        self.assertTrue(w.log_entries()[-1].startswith("=== "), "обрезано по границе записи")
+
+    def test_plan_up_down_menu_and_comment_limit(self):
+        w.save_plan(["OE-1", "OE-2", "OE-3"], set())
+        app = self.make_app(tab="day")
+        app._card_menu(KeyEv(app, 0, ""), self.card(app, "OE-2")["issue"])
+        self.assertEqual(app.menu.entrycget(app.menu_up_index, "state"), "normal")
+        app.menu.invoke(app.menu_up_index)  # ↑ Выше в плане
+        self.assertEqual(self.ids(app), ["OE-2", "OE-1", "OE-3"])
+        app._card_menu(KeyEv(app, 0, ""), self.card(app, "OE-2")["issue"])
+        self.assertEqual(app.menu.entrycget(app.menu_up_index, "state"), "disabled", "первая — выше некуда")
+        app.menu.invoke(app.menu_up_index + 1)  # ↓ Ниже
+        self.assertEqual(self.ids(app), ["OE-1", "OE-2", "OE-3"])
+        # комментарий: не длиннее 10 000 символов, в том числе при вставке
+        app.open_comment_editor(self.card(app, "OE-1")["issue"])
+        pump(app, 0.2)
+        text = next(ch for ch in app._comment_win.winfo_children() if isinstance(ch, w.tk.Text))
+        text.insert("1.0", "к" * 12_000)
+        pump(app, 0.05)
+        self.assertEqual(len(text.get("1.0", "end-1c")), w.COMMENT_MAX)
+
+    def test_settings_version_and_notification_kinds(self):
+        app = self.make_app()
+        app.open_settings()
+        win = app._settings
+        pump(app, 0.2)
+
+        def walk(r):
+            for ch in r.winfo_children():
+                yield ch
+                yield from walk(ch)
+        labels = [x.cget("text") for x in walk(win) if isinstance(x, w.tk.Label)]
+        self.assertIn(f"Версия приложения: {w.VERSION}", labels)
+        boxes = {x.cget("text"): x for x in walk(win) if isinstance(x, w.tk.Checkbutton)}
+        for t in ("вас упомянули через @", "новый комментарий", "смена статуса (под наблюдением)",
+                  "назначена новая задача", "Оформление текста как в YouTrack (полный просмотр задачи)"):
+            self.assertIn(t, boxes)
+        boxes["смена статуса (под наблюдением)"].invoke()  # выключить
+        save = next(x for x in walk(win) if isinstance(x, w.tk.Button) and x.cget("text") == "Сохранить")
+        save.invoke()
+        pump(app, 0.3)
+        cfg = w.load_cfg()
+        self.assertFalse(cfg["notify_status"])
+        self.assertTrue(cfg["notify_mentions"])
+        self.assertEqual(cfg["watch_query"], "tag: Star sort by: updated")
+
+
+class TestDayGroups(Base):
+    """Блоки на вкладке «День»: настройка, перетаскивание между блоками, меню «Переместить в блок»."""
+
+    def setUp(self):
+        super().setUp()
+        self._popup = w.tk.Menu.tk_popup
+        w.tk.Menu.tk_popup = lambda *a, **k: None
+        self.addCleanup(setattr, w.tk.Menu, "tk_popup", self._popup)
+
+    def heads(self, app):
+        cv = app.canvas
+        return [cv.itemcget(i, "text") for i in cv.find_withtag("ghead") if cv.type(i) == "text"]
+
+    def drag(self, app, card_idx, to_y):
+        cv = app.canvas
+        x1, y1, x2, y2 = cv.bbox(f"h{card_idx}")
+        x, y = (x1 + x2) / 2, (y1 + y2) / 2
+        app._on_press(Ev(x, y))
+        steps = 12
+        for k in range(1, steps + 1):
+            app._on_drag(Ev(x, y + (to_y - y) * k / steps))
+            app.update()
+        app._on_release(Ev(x, to_y))
+        pump(app, 0.1)
+
+    def make_groups(self, app, names):
+        app.open_groups_editor()
+        win = app._groups_win
+        pump(app, 0.1)
+        win._items[0]["var"].set(names[0])
+        for n in names[1:]:
+            win._add()
+            win._items[-1]["var"].set(n)
+        win._save()
+        pump(app, 0.2)
+
+    def test_single_group_has_no_headers(self):
+        w.save_plan(["OE-1", "OE-2"], set())
+        app = self.make_app(tab="day")
+        self.assertEqual(self.heads(app), [], "один блок — как раньше, без заголовков")
+        self.assertTrue(app.groups_btn.winfo_ismapped(), "кнопка настройки блоков на вкладке «День»")
+
+    def test_editor_drag_menu_and_steps(self):
+        w.save_plan(["OE-1", "OE-2", "OE-3"], set())
+        app = self.make_app(tab="day")
+        self.make_groups(app, ["На сегодня", "Требуется уточнение", "Анализ"])
+        self.assertEqual([g["name"] for g in w.load_plan_groups()[0]],
+                         ["На сегодня", "Требуется уточнение", "Анализ"], "блоки сохранены")
+        heads = self.heads(app)
+        for t in ("На сегодня", "Требуется уточнение", "Анализ"):
+            self.assertIn(t, heads)
+        self.assertIn("Перетащите задачу сюда", self.texts(app), "пустые блоки — зона для перетаскивания")
+        g = {x["name"]: x["id"] for x in app.plan_groups}
+        # перетащить OE-2 в пустой блок «Анализ»
+        cv = app.canvas
+        empties = [i for i in cv.find_withtag("gempty") if cv.type(i) == "rectangle"]
+        target = cv.bbox(empties[-1])
+        self.drag(app, self.ids(app).index("OE-2"), (target[1] + target[3]) / 2)
+        self.assertEqual(app.group_of("OE-2"), g["Анализ"])
+        self.assertEqual(self.ids(app), ["OE-1", "OE-3", "OE-2"])
+        self.assertEqual(w.load_plan_groups()[1]["OE-2"], g["Анализ"], "распределение сохранено")
+        # перетащить OE-3 в «Анализ» перед OE-2
+        b = app._card_bounds[self.ids(app).index("OE-2")]
+        self.drag(app, self.ids(app).index("OE-3"), b[0] + 6)
+        self.assertEqual(self.ids(app), ["OE-1", "OE-3", "OE-2"])
+        self.assertEqual(app.group_of("OE-3"), g["Анализ"])
+        self.assertEqual([c["id"] for c in app.visible if c["group"] == g["Анализ"]], ["OE-3", "OE-2"])
+        # меню карточки: «Переместить в блок плана» → «Требуется уточнение»
+        app._card_menu(KeyEv(app, 0, ""), self.card(app, "OE-1")["issue"])
+        app._fill_group_menu()
+        labels = [app.group_menu.entrycget(i, "label") for i in range(app.group_menu.index("end") + 1)
+                  if app.group_menu.type(i) != "separator"]
+        self.assertEqual(labels[0], "✓ На сегодня")
+        app.group_menu.invoke(1)
+        self.assertEqual(app.group_of("OE-1"), g["Требуется уточнение"])
+        # ↓ у последней задачи блока «Требуется уточнение» — в начало «Анализа»
+        app.move_plan_step(self.card(app, "OE-1")["issue"], 1)
+        self.assertEqual(app.group_of("OE-1"), g["Анализ"])
+        self.assertEqual([c["id"] for c in app.visible if c["group"] == g["Анализ"]], ["OE-1", "OE-3", "OE-2"])
+        # ↑ — обратно в конец предыдущего блока
+        app.move_plan_step(self.card(app, "OE-1")["issue"], -1)
+        self.assertEqual(app.group_of("OE-1"), g["Требуется уточнение"])
+        # первая задача первого блока: «выше» недоступно
+        app.plan_group_of["OE-1"] = g["На сегодня"]
+        app.render()
+        app._card_menu(KeyEv(app, 0, ""), self.card(app, "OE-1")["issue"])
+        self.assertEqual(app.menu.entrycget(app.menu_up_index, "state"), "disabled")
+
+    def test_add_from_all_tab_and_delete_group(self):
+        app = self.make_app()
+        self.make_groups(app, ["На сегодня", "Анализ"])
+        g = {x["name"]: x["id"] for x in app.plan_groups}
+        app._card_menu(KeyEv(app, 0, ""), self.card(app, "OE-4")["issue"])
+        app._fill_group_menu()
+        app.group_menu.invoke(1)  # «Анализ» — задачи не было в плане, добавилась
+        self.assertIn("OE-4", app.plan)
+        self.assertEqual(app.group_of("OE-4"), g["Анализ"])
+        # удалить блок «Анализ» — задача переходит в первый блок
+        app.open_groups_editor()
+        win = app._groups_win
+        win._remove(1)
+        win._save()
+        pump(app, 0.1)
+        self.assertEqual([x["name"] for x in app.plan_groups], ["На сегодня"])
+        self.assertEqual(app.group_of("OE-4"), g["На сегодня"])
+        self.assertIn("OE-4", app.plan, "задача осталась в плане")
+
+    def test_editor_validation(self):
+        app = self.make_app()
+        app.open_groups_editor()
+        win = app._groups_win
+        win._add()
+        win._items[0]["var"].set("Анализ")
+        win._items[1]["var"].set("анализ")
+        win._save()
+        self.assertTrue(win.winfo_exists(), "повтор названия не сохраняется")
+        win._items[1]["var"].set("Х" * 80)
+        self.assertEqual(len(win._items[1]["var"].get()), w.GROUP_NAME_MAX)
+        win._save()
+        self.assertFalse(win.winfo_exists())
+        self.assertEqual(len(app.plan_groups), 2)
 
 
 class TestCollapse(Base):

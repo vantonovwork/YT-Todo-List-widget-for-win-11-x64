@@ -119,6 +119,15 @@ class Store(context: Context) {
             ?: emptyList()
         set(v) = p.edit().putString("plan", JSONArray(v).toString()).apply()
 
+    /** Блоки плана на день и распределение задач по ним (idReadable → id блока). */
+    var planGroups: List<PlanGroup>
+        get() = PlanGroups.parse(p.getString("planGroups", null))
+        set(v) = p.edit().putString("planGroups", PlanGroups.toJson(v)).apply()
+
+    var planGroupOf: Map<String, String>
+        get() = PlanGroups.parseOf(p.getString("planGroupOf", null))
+        set(v) = p.edit().putString("planGroupOf", PlanGroups.ofToJson(v)).apply()
+
     /** Отметки «сделано» действуют до конца дня. */
     var done: Set<String>
         get() {

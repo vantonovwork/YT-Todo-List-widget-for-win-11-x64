@@ -15,7 +15,7 @@ import winreg
 from tkinter import filedialog, messagebox
 
 APP_NAME = "YouTrack Widget"
-VERSION = "1.3.1"
+from version import VERSION  # единый номер версии (version.py)
 EXE_NAME = "YouTrackWidget.exe"
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
 APPDATA = os.environ.get("APPDATA", os.path.expanduser(r"~\AppData\Roaming"))

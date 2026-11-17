@@ -49,7 +49,7 @@ private fun loadWidgetData(context: Context): WidgetData {
     val done = store.done
     val mine = issues.map { it.idReadable }.toSet()
     val withMentions = issues + store.mentions().filter { it.idReadable !in mine }  // чужие задачи из «Нужно внимание» тоже бывают в плане
-    val planned = Model.planOrder(withMentions, plan, done).filter { it.idReadable !in done }
+    val planned = Model.planOrder(withMentions, plan, done, store.planGroups, store.planGroupOf).filter { it.idReadable !in done }
     val (title, list) = if (planned.isNotEmpty()) "На день" to planned else "Мои задачи" to issues
     val seen = store.seen
     val me = store.me

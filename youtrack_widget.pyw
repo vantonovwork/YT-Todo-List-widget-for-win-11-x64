@@ -23,6 +23,10 @@ import tkinter as tk
 from tkinter import colorchooser, messagebox
 
 APP = "YouTrackWidget"
+try:
+    from version import VERSION  # единый номер версии виджета и установщика
+except ImportError:
+    VERSION = "?"
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
 SEEN_PATH = os.path.join(CFG_DIR, "seen.json")  # когда последний раз смотрели комментарии задачи
@@ -30,6 +34,7 @@ PLAN_PATH = os.path.join(CFG_DIR, "day_plan.json")  # ID задач, отмеч�
 ATTN_PATH = os.path.join(CFG_DIR, "attention.json")  # упоминания, отмеченные вручную как «отвечено»
 URGENT_PATH = os.path.join(CFG_DIR, "urgent.json")  # свои срочные задачи (только в виджете, не в YouTrack)
 URGENT_TITLE_MAX, URGENT_TEXT_MAX = 100, 1000
+COMMENT_MAX = 10_000  # длина комментария в YouTrack (как в Android-версии)
 MIN_W, MIN_H = 340, 220  # минимальный размер окна
 STARTUP_LNK = os.path.join(
     os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup", "YouTrack Widget.lnk"
@@ -58,7 +63,13 @@ DEFAULTS = {
     "sprint_filter": [],   # выбранные спринты; пусто — все
     "tray": True,          # значок в трее; ✕ прячет виджет в трей
     "mentions_query": "mentions: me #Unresolved",  # вкладка «Нужно внимание»: задачи, где вас упомянули
-    "notify": True,        # уведомления Windows о новых задачах и комментариях
+    "notify": True,        # уведомления Windows (общий выключатель)
+    "notify_mentions": True,   # …вас упомянули через @
+    "notify_comments": True,   # …новый комментарий в ваших задачах и задачах под наблюдением
+    "notify_status": True,     # …смена статуса задачи под наблюдением
+    "notify_assigned": True,   # …назначена новая задача
+    "watch_query": "tag: Star sort by: updated",  # задачи под наблюдением (без #Unresolved — видно и закрытие)
+    "markdown": True,      # оформление описания и комментариев как в YouTrack (полный просмотр)
     "hotkey": "Win+Shift+Y",  # показать/спрятать виджет из любого окна; пусто — выключено
 }
 
@@ -90,7 +101,7 @@ ICONS = {  # имя: (код из MaterialIconsRound-Regular.codepoints, зап�
     "filter_list": ("", ""), "arrow_drop_down": ("", "▾"), "search": ("", ""),
     "drag_indicator": ("", "⋮"), "radio_button_unchecked": ("", "○"),
     "check_circle": ("", "✔"), "open_in_new": ("", "↗"),
-    "bolt": ("", "⚡"), "add": ("", "+"), "edit": ("", "✎"), "expand_more": ("", "▾"),
+    "bolt": ("", "⚡"), "add": ("", "+"), "edit": ("", "✎"), "tune": ("\ue429", "⚙"), "expand_more": ("", "▾"),
     "delete_outline": ("", "🗑"), "delete_sweep": ("", "🗑"),
     "add_comment": ("", "✍"),
     "alternate_email": ("", "@"),
@@ -224,6 +235,91 @@ def save_cfg(cfg: dict):
     os.replace(tmp, CFG_PATH)
 
 
+# ---------------------------------------------------------------- журнал ошибок
+# Как в Android-версии: записи «=== дата LEVEL · где · версия», текст и до 60 строк трассировки;
+# файл не больше 256 КБ (старая половина обрезается); токен и адреса в журнал не попадают.
+LOG_PATH = os.path.join(CFG_DIR, "errors.log")
+LOG_MAX = 256 * 1024
+_LOG_LOCK = threading.Lock()
+
+
+def _scrub(text: str) -> str:
+    text = re.sub(r"perm:[\w.\-=]+", "perm:***", text or "")
+    return re.sub(r"https?://[^\s'\"<>)]+", "<адрес>", text)
+
+
+def log_event(level: str, where: str, message: str = "", exc: BaseException = None):
+    """Записать в журнал: level — CRASH / ERROR / WARN."""
+    import traceback
+    lines = [f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} {level} · {where} · {VERSION}"]
+    if message:
+        lines.append(_scrub(str(message)))
+    if exc is not None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip().splitlines()
+        lines += [_scrub(x) for x in tb[-60:]]
+    entry = "\n".join(lines) + "\n"
+    try:
+        with _LOG_LOCK:
+            os.makedirs(CFG_DIR, exist_ok=True)
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(entry)
+            if os.path.getsize(LOG_PATH) > LOG_MAX:  # обрезать по началу записи после середины файла
+                with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                    data = f.read()
+                cut = data.find("\n=== ", len(data) // 2)
+                with open(LOG_PATH, "w", encoding="utf-8") as f:
+                    f.write(data[cut + 1:] if cut >= 0 else data[-LOG_MAX // 2:])
+    except OSError:
+        pass
+
+
+def log_entries() -> list:
+    """Записи журнала, новые первыми."""
+    try:
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError:
+        return []
+    parts = re.split(r"(?m)^(?==== )", data)
+    return [p.rstrip("\n") for p in parts if p.strip()][::-1]
+
+
+def log_header() -> str:
+    import platform
+    return (f"YouTrack Widget {VERSION}\nWindows {platform.version()} ({platform.machine()})\n"
+            f"Python {platform.python_version()}, Tk {tk.TkVersion}")
+
+
+def log_report(limit: int = 60_000) -> str:
+    """Текст для отправки разработчику: шапка + последние limit символов журнала."""
+    try:
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+            body = f.read()[-limit:]
+    except OSError:
+        body = ""
+    return f"{log_header()}\n\n{body or 'Журнал пуст.'}"
+
+
+def install_crash_logging():
+    """Необработанные ошибки — в журнал; падение запоминается, чтобы при следующем запуске предложить отправку."""
+    def hook(t, v, tb):
+        v = v if v is not None else t()
+        if tb is not None and getattr(v, "__traceback__", None) is None:
+            v.__traceback__ = tb
+        log_event("CRASH", "приложение", f"{t.__name__}: {v}", v)
+        try:
+            cfg = load_cfg()
+            cfg["crash_pending"] = f"{t.__name__}: {v}"[:300]
+            save_cfg(cfg)
+        except Exception:
+            pass
+        sys.__excepthook__(t, v, tb)
+
+    sys.excepthook = hook
+    threading.excepthook = lambda a: log_event("ERROR", f"поток {a.thread.name if a.thread else ''}",
+                                               f"{a.exc_type.__name__}: {a.exc_value}", a.exc_value)
+
+
 # ---------------------------------------------------------------- YouTrack API
 class YTError(Exception):
     pass
@@ -315,6 +411,23 @@ def apply_command(base_url: str, token: str, issue: dict, command: str):
     _post(base_url, token, "/api/commands", {}, {"query": command, "issues": [{"id": issue["id"]}]})
 
 
+def fetch_status_author(base_url: str, token: str, issue: dict, field_name: str, value: str):
+    """Кто последним поставил полю field_name значение value: {"login", "fullName"} или None (история задачи)."""
+    acts = _get(base_url, token, f"/api/issues/{issue['id']}/activities",
+                {"categories": "CustomFieldCategory",
+                 "fields": "timestamp,author(login,fullName),field(name),added(name)",
+                 "$reverse": "true", "$top": "30"})
+    for a in acts if isinstance(acts, list) else []:
+        if ((a.get("field") or {}).get("name") or "").lower() != field_name.lower():
+            continue
+        added = a.get("added")
+        names = ", ".join(x.get("name") or "" for x in added if isinstance(x, dict)) if isinstance(added, list) \
+            else (added or {}).get("name", "") if isinstance(added, dict) else str(added or "")
+        if names.lower() == (value or "").lower():
+            return a.get("author") or None
+    return None
+
+
 COMMENT_MAX = 10000  # ограничение длины комментария в окне виджета
 
 
@@ -359,6 +472,9 @@ def _get(base_url: str, token: str, path: str, params: dict):
                 raise YTError(f"Ошибка в запросе: {msg or 'HTTP 400'}")
             raise YTError(f"Ошибка сервера: HTTP {e.code}")
     except urllib.error.URLError as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e.reason) or type(e.reason).__name__.startswith("SSL"):
+            raise YTError("Ошибка сертификата сервера (SSL): система не доверяет сертификату YouTrack. "
+                          "Проверьте адрес или установите корневой сертификат организации")
         if isinstance(e.reason, socket.gaierror):
             host = urllib.parse.urlparse(base).hostname
             raise YTError(f"Адрес «{host}» не найден. Проверьте адрес YouTrack "
@@ -504,11 +620,43 @@ def load_plan():
     return ids, done
 
 
-def save_plan(plan: list, done=()):
+DEFAULT_GROUPS = [{"id": "main", "name": "Задачи на день"}]
+GROUP_NAME_MAX = 40
+
+
+def load_plan_groups():
+    """Блоки плана на день: ([{"id", "name"}, …] по порядку, {idReadable: id блока}).
+    Задача без блока (или из удалённого блока) попадает в первый блок."""
+    try:
+        with open(PLAN_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    groups = []
+    if isinstance(data, dict):
+        for g in data.get("groups") or []:
+            if isinstance(g, dict) and g.get("id") and str(g.get("name") or "").strip():
+                groups.append({"id": str(g["id"]), "name": str(g["name"]).strip()[:GROUP_NAME_MAX]})
+    if not groups:
+        groups = [dict(g) for g in DEFAULT_GROUPS]
+    ids = {g["id"] for g in groups}
+    group_of = {}
+    if isinstance(data, dict) and isinstance(data.get("group_of"), dict):
+        group_of = {str(k): str(v) for k, v in data["group_of"].items() if str(v) in ids}
+    return groups, group_of
+
+
+def save_plan(plan: list, done=(), groups=None, group_of=None):
+    """Сохранить план; блоки и распределение по ним — если переданы, иначе остаются как были в файле."""
+    if groups is None or group_of is None:
+        old_groups, old_of = load_plan_groups()
+        groups = old_groups if groups is None else groups
+        group_of = old_of if group_of is None else group_of
     os.makedirs(CFG_DIR, exist_ok=True)
     tmp = PLAN_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"ids": plan, "done_date": _today(), "done": sorted(done)}, f, ensure_ascii=False)
+        json.dump({"ids": plan, "done_date": _today(), "done": sorted(done), "groups": groups,
+                   "group_of": {k: v for k, v in group_of.items() if k in set(plan)}}, f, ensure_ascii=False)
     os.replace(tmp, PLAN_PATH)
 
 
@@ -668,6 +816,12 @@ def clean_markdown(text: str, limit: int) -> str:
     text = "\n".join(line.strip() for line in text.split("\n"))
     text = re.sub(r"\n\s*\n+", "\n", text).strip()
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def fetch_full(base_url: str, token: str, issue: dict) -> dict:
+    """Для полного просмотра: описание и все комментарии задачи (свежие с сервера)."""
+    return _get(base_url, token, f"/api/issues/{issue['id']}",
+                {"fields": "description,comments(created,deleted,text,author(login,fullName))"})
 
 
 def fetch_description(base_url: str, token: str, issue: dict) -> str:
@@ -1020,6 +1174,161 @@ def acquire_single_instance(q: queue.Queue) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- оформление текста как в YouTrack (Markdown → tk.Text)
+_MD_INLINE = re.compile(
+    r"(?P<code>`[^`\n]+`)"
+    r"|(?P<img>!\[(?P<img_alt>[^\]]*)\]\((?P<img_url>[^)\s]+)[^)]*\))"
+    r"|(?P<link>\[(?P<link_text>[^\]]+)\]\((?P<link_url>[^)\s]+)[^)]*\))"
+    r"|(?P<bold>\*\*(?P<bold_t>.+?)\*\*|__(?P<bold_u>.+?)__)"
+    r"|(?P<strike>~~(?P<strike_t>.+?)~~)"
+    r"|(?P<ital>(?<![\w*])\*(?P<ital_t>[^*\n]+?)\*(?![\w*])|(?<![\w_])_(?P<ital_u>[^_\n]+?)_(?![\w_]))"
+    r"|(?P<url>https?://[^\s<>()\[\]]+)"
+    r"|(?P<mention>(?<![\w.@])@[\w.\-]+\w)")
+
+
+class MarkdownRenderer:
+    """Простой рендер разметки YouTrack в tk.Text: заголовки, жирный/курсив/зачёркнутый, код и блоки кода,
+    цитаты, списки и флажки, таблицы, разделители, ссылки (кликабельны), картинки — подписью-ссылкой.
+    prefix — свой набор стилей (чтобы стили комментариев не перебивали стили описания),
+    margin — отступ всего текста слева и справа (для «облачков» комментариев)."""
+
+    def __init__(self, text: tk.Text, base_url: str = "", open_url=None, colors=None, size: int = 10,
+                 prefix: str = "", margin: int = 0):
+        self.t, self.base, self.open_url = text, (base_url or "").rstrip("/"), open_url or (lambda u: None)
+        self.prefix = prefix
+        col = colors or {}
+        fg, sub, acc = col.get("text", "#e8e8e8"), col.get("sub", "#9d9d9d"), col.get("accent", "#4cc2ff")
+        code_bg = col.get("code_bg", "#2f2f2f")
+        m = margin
+        cfg = self.t.tag_configure
+        k = self.k
+        cfg(k("p"), font=(FONT, size), foreground=fg, spacing1=1, spacing3=3, lmargin1=m, lmargin2=m, rmargin=m)
+        cfg(k("h1"), font=(FONT, size + 6, "bold"), foreground=fg, spacing1=8, spacing3=4, lmargin1=m, lmargin2=m)
+        cfg(k("h2"), font=(FONT, size + 4, "bold"), foreground=fg, spacing1=6, spacing3=3, lmargin1=m, lmargin2=m)
+        cfg(k("h3"), font=(FONT, size + 2, "bold"), foreground=fg, spacing1=4, spacing3=2, lmargin1=m, lmargin2=m)
+        cfg(k("b"), font=(FONT, size, "bold"))
+        cfg(k("i"), font=(FONT, size, "italic"))
+        cfg(k("s"), overstrike=True)
+        cfg(k("code"), font=("Consolas", size - 1), background=code_bg)
+        cfg(k("pre"), font=("Consolas", size - 1), background=code_bg, lmargin1=m + 12, lmargin2=m + 12,
+            spacing1=0, spacing3=0)
+        cfg(k("quote"), foreground=sub, lmargin1=m + 16, lmargin2=m + 16)
+        cfg(k("li"), lmargin1=m + 12, lmargin2=m + 28)
+        cfg(k("table"), font=("Consolas", size - 1), lmargin1=m + 6, lmargin2=m + 6)
+        cfg(k("hr"), foreground=sub, lmargin1=m, lmargin2=m)
+        cfg(k("gap"), font=(FONT, max(3, size // 3)))
+        cfg(k("link"), foreground=acc, underline=True)
+        cfg(k("mention"), foreground=acc)
+        cfg(k("img"), foreground=acc, underline=True)
+        self._n = 0
+
+    def k(self, name):
+        return self.prefix + name
+
+    def _url(self, url):
+        if url.startswith(("http://", "https://", "mailto:")):
+            return url
+        if url.startswith("/"):
+            return self.base + url
+        return ""  # вложение по имени файла — откроем задачу
+
+    def _link(self, text, url, tags, kind="link"):
+        self._n += 1
+        tag = f"{self.prefix}{kind}-{self._n}"
+        self.t.insert("end", text, tags + (self.k(kind), tag))
+        self.t.tag_bind(tag, "<Button-1>", lambda e, u=url: self.open_url(u))
+        self.t.tag_bind(tag, "<Enter>", lambda e: self.t.configure(cursor="hand2"))
+        self.t.tag_bind(tag, "<Leave>", lambda e: self.t.configure(cursor=""))
+
+    def inline(self, text, tags=None):
+        tags = tags or (self.k("p"),)
+        k = self.k
+        pos = 0
+        for m in _MD_INLINE.finditer(text):
+            if m.start() > pos:
+                self.t.insert("end", text[pos:m.start()], tags)
+            if m.group("code"):
+                self.t.insert("end", m.group("code")[1:-1], tags + (k("code"),))
+            elif m.group("img"):
+                alt = m.group("img_alt") or os.path.basename(m.group("img_url")) or "картинка"
+                self._link(f"🖼 {alt}", self._url(m.group("img_url")), tags, "img")
+            elif m.group("link"):
+                self._link(m.group("link_text"), self._url(m.group("link_url")), tags)
+            elif m.group("bold"):
+                self.inline(m.group("bold_t") or m.group("bold_u"), tags + (k("b"),))
+            elif m.group("strike"):
+                self.inline(m.group("strike_t"), tags + (k("s"),))
+            elif m.group("ital"):
+                self.inline(m.group("ital_t") or m.group("ital_u"), tags + (k("i"),))
+            elif m.group("url"):
+                self._link(m.group("url"), m.group("url"), tags)
+            elif m.group("mention"):
+                self.t.insert("end", m.group("mention"), tags + (k("mention"),))
+            pos = m.end()
+        if pos < len(text):
+            self.t.insert("end", text[pos:], tags)
+
+    def render(self, md: str, extra=()):
+        """Добавить в конец виджета отрендеренный Markdown; extra — теги на весь добавленный текст."""
+        start = self.t.index("end-1c")
+        k = self.k
+        p = k("p")
+        lines = (md or "").replace("\r\n", "\n").split("\n")
+        i, n = 0, len(lines)
+        while i < n:
+            line = lines[i]
+            s = line.strip()
+            if s.startswith("```"):  # блок кода
+                i += 1
+                block = []
+                while i < n and not lines[i].strip().startswith("```"):
+                    block.append(lines[i])
+                    i += 1
+                self.t.insert("end", "\n".join(block) + "\n", (k("pre"),))
+                i += 1
+                continue
+            if not s:  # пустая строка между абзацами — небольшой отступ, а не целая строка
+                self.t.insert("end", "\n", (k("gap"),))
+                i += 1
+                continue
+            hm = re.match(r"(#{1,6})\s+(.*)", s)
+            if hm:
+                self.inline(hm.group(2), (k(f"h{min(3, len(hm.group(1)))}"),))
+                self.t.insert("end", "\n", (p,))
+            elif re.fullmatch(r"([-*_])\s*(\1\s*){2,}", s):
+                self.t.insert("end", "─" * 40 + "\n", (k("hr"),))
+            elif s.startswith(">"):
+                self.inline(s.lstrip(">").strip(), (p, k("quote")))
+                self.t.insert("end", "\n", (p,))
+            elif s.startswith("|"):  # таблица: собираем строки и выравниваем колонки
+                rows = []
+                while i < n and lines[i].strip().startswith("|"):
+                    cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                    if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                        rows.append([clean_markdown(c, 200) for c in cells])
+                    i += 1
+                widths = [max(len(r[j]) if j < len(r) else 0 for r in rows) for j in range(max(map(len, rows)))]
+                for r in rows:
+                    self.t.insert("end", " │ ".join((r[j] if j < len(r) else "").ljust(widths[j])
+                                                   for j in range(len(widths))) + "\n", (k("table"),))
+                continue
+            else:
+                lm = re.match(r"(\s*)([-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?(.*)", line)
+                if lm:
+                    depth = len(lm.group(1).expandtabs(4)) // 2
+                    box = lm.group(3)
+                    mark = ("☑ " if box and box[1] in "xX" else "☐ ") if box else (
+                        lm.group(2) + " " if lm.group(2)[0].isdigit() else "• ")
+                    self.t.insert("end", "    " * depth + mark, (p, k("li")))
+                    self.inline(lm.group(4), (p, k("li")))
+                else:
+                    self.inline(s, (p,))
+                self.t.insert("end", "\n", (p,))
+            i += 1
+        for tag in extra:
+            self.t.tag_add(tag, start, "end-1c")
+
+
 # ---------------------------------------------------------------- буфер обмена в полях ввода
 # Tk 8.6 на Windows узнаёт Ctrl+V/C/X по латинской букве. В русской раскладке клавиша V даёт «м»
 # (keysym Cyrillic_em), и вставка/копирование по горячим клавишам не срабатывают. Поэтому сочетания
@@ -1102,6 +1411,7 @@ class Widget(tk.Tk):
         self.last_ok = None
         self.seen = load_seen()
         self.plan, self.plan_done = load_plan()
+        self.plan_groups, self.plan_group_of = load_plan_groups()  # блоки вкладки «День»
         self.urgent = load_urgent()
         self.mentions = []            # задачи, где вас упомянули (вкладка «Нужно внимание»)
         self.attn_handled = load_attn()  # idReadable -> время упоминания, отмеченного вручную «отвечено»
@@ -1113,6 +1423,10 @@ class Widget(tk.Tk):
         self.tray = None
         self._notified = None   # idReadable -> время последнего комментария, о котором уже уведомили
         self._mention_seen = None  # idReadable -> время последнего упоминания, о котором уже знаем
+        self._watch_state = None   # задачи под наблюдением: {"states": id->статус, "comments": id->время}
+        self._pending_watched = None
+        self._pending_mention_events = []
+        self.watch_error = ""
         self._known_ids = None  # задачи из прошлой загрузки (чтобы заметить новые назначения)
         self.me_login = ""
 
@@ -1139,6 +1453,7 @@ class Widget(tk.Tk):
         self.after(200, self._poll_queue)
         self.after(300, self.setup_hotkey)
         self.after(350, self.setup_tray)
+        self.after(1500, self._offer_crash_report)  # после аварийного закрытия — предложить отправить журнал
 
         if not self.cfg["base_url"] or not unprotect(self.cfg["token_enc"]):
             self._show_message("Нажмите ⚙, чтобы подключить YouTrack")
@@ -1164,6 +1479,9 @@ class Widget(tk.Tk):
 
     def _build(self):
         self.search_box = None  # при перестройке окна старое поле поиска уже удалено
+        self._detail_cache = {}   # idReadable -> встроенное поле с содержимым раскрытой карточки
+        self._detail_fit, self._detail_fit_job = set(), None
+        self._detail_by_index = {}
         # Заголовок
         self.header = tk.Frame(self, bg=HEADER, height=40)
         self.header.pack(fill="x")
@@ -1229,6 +1547,10 @@ class Widget(tk.Tk):
         self.clear_plan_btn = tk.Label(tabs, text=ic("delete_sweep"), bg=BG, fg=BG_SUB, font=icon_font(FS + 3),
                                        cursor="hand2")
         self.clear_plan_btn.bind("<Button-1>", lambda e: self.clear_plan())
+        self.groups_btn = tk.Label(tabs, text=ic("tune"), bg=BG, fg=BG_SUB, font=icon_font(FS + 3), cursor="hand2")
+        self.groups_btn.bind("<Button-1>", lambda e: self.open_groups_editor())
+        self.groups_btn.bind("<Enter>", lambda e: self.status_lbl.configure(
+            text="Блоки плана на день: добавить, переименовать, удалить", fg=BG_SUB))
         self.clear_plan_btn.bind("<Enter>", lambda e: self.status_lbl.configure(text="Очистить план на день",
                                                                                 fg=BG_SUB))
         self._short_tabs = self._tabs_level()
@@ -1356,6 +1678,14 @@ class Widget(tk.Tk):
         self.menu.add_separator()
         self.menu.add_command(label="Копировать ID", command=lambda: self._copy(self.menu_issue["idReadable"]))
         self.menu.add_command(label="Копировать ссылку", command=lambda: self._copy(self.issue_url(self.menu_issue)))
+        # «Переместить в блок ▸» — блоки плана на день (задачи нет в плане — добавится)
+        self.group_menu = tk.Menu(self.menu, tearoff=0, bg=CARD, fg=TEXT, activebackground=CARD_HOVER,
+                                  activeforeground=TEXT, bd=0, postcommand=self._fill_group_menu)
+        self.menu.add_cascade(label="Переместить в блок плана", menu=self.group_menu)
+        self.menu.add_separator()  # порядок в плане на день (как кнопки ↑↓ в Android-версии)
+        self.menu.add_command(label="↑ Выше в плане", command=lambda: self.move_plan_step(self.menu_issue, -1))
+        self.menu.add_command(label="↓ Ниже в плане", command=lambda: self.move_plan_step(self.menu_issue, 1))
+        self.menu_up_index = self.menu.index("end") - 1
 
     def _make_fonts(self):
         """Шрифты как объекты: размеры текста меряем без создания виджетов."""
@@ -1589,6 +1919,268 @@ class Widget(tk.Tk):
         elif cmd == 9:
             self.quit_app()
 
+    # ----- план на день: ↑/↓ из меню карточки (как кнопки в Android-версии)
+    def move_plan_step(self, issue, delta):
+        if not issue or self.cfg.get("tab") != "day" or not self._can_drag():
+            return
+        ids = [c["id"] for c in self.visible]
+        iid = issue.get("idReadable")
+        if iid not in ids:
+            return
+        k = ids.index(iid)
+        j = k + delta
+        gids = [g["id"] for g in self.plan_groups]
+        mine = self.group_of(iid)
+        if 0 <= j < len(ids) and self.group_of(ids[j]) == mine:
+            ids[k], ids[j] = ids[j], ids[k]  # внутри блока — поменять местами с соседом
+            self.move_in_plan(ids)
+            return
+        gi = gids.index(mine) + delta  # на границе блока — в соседний блок
+        if 0 <= gi < len(gids):
+            self.plan_group_of[iid] = gids[gi]
+            ids.remove(iid)
+            same = [n for n, x in enumerate(ids) if self.group_of(x) == gids[gi]]
+            pos = (same[-1] + 1 if delta < 0 else same[0]) if same else len(ids)
+            ids.insert(pos, iid)
+            self.move_in_plan(ids)
+
+    def open_groups_editor(self):
+        """Окно настройки блоков плана на день: названия, порядок, добавление и удаление."""
+        old = getattr(self, "_groups_win", None)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            return
+        import uuid
+        BG_, CARD_, TEXT_, SUB_ = DLG_BG, DLG_CARD, DLG_TEXT, DLG_SUB
+        win = tk.Toplevel(self)
+        self._groups_win = win
+        win.title("Блоки плана на день")
+        win.configure(bg=BG_, padx=16, pady=12)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            v = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(v), ctypes.sizeof(v))
+        except Exception:
+            pass
+        tk.Label(win, text="Блоки вкладки «День»", bg=BG_, fg=TEXT_, font=(FONT, 11, "bold")).pack(anchor="w")
+        tk.Label(win, text="Например: «Требуется уточнение», «Анализ», «В работе». Задачи перетаскиваются между\n"
+                           "блоками за ручку ⋮⋮ или через меню карточки. Задачи удалённого блока перейдут в первый.",
+                 bg=BG_, fg=SUB_, font=(FONT, 8), justify="left").pack(anchor="w", pady=(2, 8))
+        rows_fr = tk.Frame(win, bg=BG_)
+        rows_fr.pack(fill="x")
+        items = [{"id": g["id"], "var": tk.StringVar(value=g["name"])} for g in self.plan_groups]
+        counts = {}
+        for iid in self.plan:
+            gid = self.group_of(iid)
+            counts[gid] = counts.get(gid, 0) + 1
+        err = tk.Label(win, text="", bg=BG_, fg=ERR, font=(FONT, 9))
+
+        def icon_btn(parent, text, cmd, enabled=True):
+            b = tk.Label(parent, text=text, bg=BG_, fg=TEXT_ if enabled else "#5a5a5a",
+                         font=icon_font(14) if ICON_OK and len(text) == 1 and ord(text) > 0xE000 else (FONT, 11),
+                         cursor="hand2" if enabled else "", padx=3)
+            if enabled:
+                b.bind("<Button-1>", lambda e: cmd())
+            return b
+
+        def draw():
+            for ch in rows_fr.winfo_children():
+                ch.destroy()
+            for n, it in enumerate(items):
+                row = tk.Frame(rows_fr, bg=BG_)
+                row.pack(fill="x", pady=2)
+                e = tk.Entry(row, textvariable=it["var"], bg=CARD_, fg=TEXT_, insertbackground=TEXT_, relief="flat",
+                             font=(FONT, 10), width=30)
+                e.pack(side="left", ipady=4, ipadx=4)
+                it["entry"] = e
+                tk.Label(row, text=f"задач: {counts.get(it['id'], 0)}", bg=BG_, fg=SUB_, font=(FONT, 8),
+                         width=9, anchor="w").pack(side="left", padx=(8, 4))
+                icon_btn(row, "↑", lambda k=n: move(k, -1), n > 0).pack(side="left")
+                icon_btn(row, "↓", lambda k=n: move(k, 1), n < len(items) - 1).pack(side="left")
+                icon_btn(row, ic("delete_outline"), lambda k=n: remove(k), len(items) > 1).pack(side="left", padx=(4, 0))
+
+        def limit(var):
+            v = var.get()
+            if len(v) > GROUP_NAME_MAX:
+                var.set(v[:GROUP_NAME_MAX])
+
+        def move(k, delta):
+            items[k], items[k + delta] = items[k + delta], items[k]
+            draw()
+
+        def remove(k):
+            n = counts.get(items[k]["id"], 0)
+            if n and not messagebox.askyesno("Блоки плана", f"Удалить блок «{items[k]['var'].get()}»?\n"
+                                             f"Его задачи ({n}) перейдут в первый блок.", parent=win):
+                return
+            items.pop(k)
+            draw()
+
+        def add():
+            it = {"id": "g-" + uuid.uuid4().hex[:8], "var": tk.StringVar(value="")}
+            it["var"].trace_add("write", lambda *a, v=it["var"]: limit(v))
+            items.append(it)
+            draw()
+            it["entry"].focus_set()
+
+        for it in items:
+            it["var"].trace_add("write", lambda *a, v=it["var"]: limit(v))
+        add_btn = tk.Label(win, text="+ Добавить блок", bg=BG_, fg=ACCENT_DLG, font=(FONT, 9, "underline"),
+                           cursor="hand2")
+        add_btn.pack(anchor="w", pady=(6, 0))
+        add_btn.bind("<Button-1>", lambda e: add())
+        err.pack(anchor="w", pady=(6, 0))
+
+        def save(_=None):
+            names = [it["var"].get().strip() for it in items]
+            if not any(names):
+                err.configure(text="Нужен хотя бы один блок с названием")
+                return "break"
+            low = [n.lower() for n in names if n]
+            if len(low) != len(set(low)):
+                err.configure(text="Названия блоков не должны повторяться")
+                return "break"
+            self.set_groups([{"id": it["id"], "name": it["var"].get()} for it in items])
+            win.destroy()
+            return "break"
+
+        btns = tk.Frame(win, bg=BG_)
+        btns.pack(anchor="e", pady=(10, 0))
+        bstyle = dict(relief="flat", font=(FONT, 9), padx=12, pady=4, cursor="hand2", bd=0)
+        tk.Button(btns, text="Отмена", command=win.destroy, bg=CARD_, fg=TEXT_, activebackground=DLG_HOVER,
+                  activeforeground=TEXT_, **bstyle).pack(side="left", padx=4)
+        tk.Button(btns, text="Сохранить", command=save, bg="#0067c0", fg="white", activebackground="#1975c5",
+                  activeforeground="white", **bstyle).pack(side="left", padx=4)
+        win.bind("<Return>", save)
+        win.bind("<Escape>", lambda e: win.destroy())
+        draw()
+        win.update_idletasks()
+        x = max(0, min(self.winfo_x() - win.winfo_width() - 10, self.winfo_screenwidth() - win.winfo_width()))
+        win.geometry(f"+{x}+{max(0, self.winfo_y() + 40)}")
+        win._items, win._save, win._add, win._remove, win._move = items, save, add, remove, move  # для автотестов
+
+    def _plan_step_possible(self, iid, delta):
+        ids = [c["id"] for c in self.visible]
+        if iid not in ids:
+            return False
+        k = ids.index(iid)
+        gids = [g["id"] for g in self.plan_groups]
+        gi = gids.index(self.group_of(iid))
+        within = 0 <= k + delta < len(ids) and self.group_of(ids[k + delta]) == gids[gi]
+        return within or 0 <= gi + delta < len(gids)
+
+    # ----- журнал ошибок
+    def report_callback_exception(self, exc, val, tb):
+        """Ошибка в обработчике интерфейса: приложение не падает, ошибка — в журнал."""
+        if val is not None and tb is not None:
+            val.__traceback__ = tb
+        log_event("ERROR", "интерфейс", f"{exc.__name__}: {val}", val)
+        try:
+            self.status_lbl.configure(text="Произошла ошибка — она записана в журнал (⚙ → Журнал ошибок)", fg=ERR)
+        except Exception:
+            pass
+
+    def _offer_crash_report(self):
+        """После аварийного закрытия — предложить отправить журнал (как в Android-версии)."""
+        pending = self.cfg.pop("crash_pending", None)
+        if not pending:
+            return
+        save_cfg(self.cfg)
+        if messagebox.askyesno("Приложение аварийно закрылось",
+                               "Ошибка записана в журнал. Отправьте его разработчику — это поможет её исправить.\n\n"
+                               f"{pending}\n\nСохранить журнал для отправки?", parent=self):
+            self.send_log()
+
+    @staticmethod
+    def _desktop_dir():
+        buf = ctypes.create_unicode_buffer(260)
+        ctypes.windll.shell32.SHGetFolderPathW(0, 0x10, 0, 0, buf)  # рабочий стол (учитывает OneDrive)
+        return buf.value or os.path.join(os.path.expanduser("~"), "Desktop")
+
+    def send_log(self, parent=None):
+        """«Отправить журнал»: файл с журналом на рабочий стол (выделен в Проводнике) + текст в буфер обмена."""
+        report = log_report()
+        name = f"YouTrackWidget-журнал-{VERSION}-{time.strftime('%Y%m%d-%H%M')}.txt"
+        try:
+            path = os.path.join(self._desktop_dir(), name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report)
+        except OSError as ex:
+            messagebox.showerror("Журнал ошибок", f"Не удалось сохранить файл: {ex}", parent=parent or self)
+            return None
+        self.clipboard_clear()
+        self.clipboard_append(report)
+        subprocess.Popen(["explorer.exe", "/select,", path], creationflags=0x08000000)
+        messagebox.showinfo("Журнал ошибок", f"Журнал сохранён на рабочий стол:\n{name}\n\nФайл выделен в Проводнике, "
+                            "текст скопирован в буфер обмена — отправьте его разработчику.", parent=parent or self)
+        return path
+
+    def open_log_window(self):
+        """Окно журнала: шапка, последние 30 записей (сбои — красным), Отправить / Копировать / Очистить."""
+        old = getattr(self, "_log_win", None)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            return
+        win = tk.Toplevel(self)
+        self._log_win = win
+        win.title("Журнал ошибок — YouTrack Widget")
+        win.configure(bg=DLG_BG, padx=14, pady=12)
+        win.attributes("-topmost", True)
+        txt = tk.Text(win, bg=DLG_CARD, fg=DLG_TEXT, insertbackground=DLG_TEXT, relief="flat", wrap="word",
+                      font=("Consolas", 9), width=96, height=30, padx=8, pady=6)
+        sb = tk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.tag_configure("head", foreground=DLG_SUB)
+        txt.tag_configure("crash", foreground=ERR)
+        txt.tag_configure("title", foreground=ACCENT_DLG)
+
+        def fill():
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("end", log_header() + "\n\n", "head")
+            entries = log_entries()
+            if not entries:
+                txt.insert("end", "Ошибок нет — журнал пуст.", "head")
+            for e in entries[:30]:
+                lines = e.splitlines()
+                tag = "crash" if " CRASH · " in lines[0] else "title"
+                txt.insert("end", lines[0] + "\n", tag)
+                txt.insert("end", "\n".join(lines[1:14]) + ("\n…" if len(lines) > 14 else "") + "\n\n",
+                           "crash" if tag == "crash" else ())
+            txt.configure(state="disabled")  # только чтение, но выделять и копировать можно
+
+        def clear():
+            if messagebox.askyesno("Журнал ошибок", "Очистить журнал?", parent=win):
+                try:
+                    os.remove(LOG_PATH)
+                except OSError:
+                    pass
+                fill()
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(log_report())
+            status.configure(text="Скопировано в буфер обмена")
+
+        btns = tk.Frame(win, bg=DLG_BG)
+        bstyle = dict(relief="flat", font=(FONT, 9), padx=12, pady=4, cursor="hand2", bd=0, bg=DLG_CARD,
+                      fg=DLG_TEXT, activebackground=DLG_HOVER, activeforeground=DLG_TEXT)
+        tk.Button(btns, text="Отправить журнал", command=lambda: self.send_log(win), **bstyle).pack(side="left")
+        tk.Button(btns, text="Копировать", command=copy, **bstyle).pack(side="left", padx=6)
+        tk.Button(btns, text="Очистить", command=clear, **bstyle).pack(side="left")
+        tk.Button(btns, text="Закрыть", command=win.destroy, **bstyle).pack(side="right")
+        status = tk.Label(btns, text="", bg=DLG_BG, fg=DLG_SUB, font=(FONT, 9))
+        status.pack(side="left", padx=10)
+        btns.pack(side="bottom", fill="x", pady=(10, 0))
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win._fill, win._text = fill, txt  # для автотестов
+        fill()
+
     def quit_app(self):
         self._save_geometry()
         stop_hotkey(self._hotkey_tid)
@@ -1632,8 +2224,9 @@ class Widget(tk.Tk):
                 self._draw_badge(issue["idReadable"], 0)
                 self._update_header_count()
 
-    # ----- уведомления о новых задачах и комментариях
+    # ----- уведомления (как в Android-версии): назначение, комментарии, упоминания, смена статуса
     def _notify_events(self, issues):
+        """События по своим задачам: новая назначенная задача, новые комментарии других (с @вами — «упоминание»)."""
         me = self.me_login.lower()
         ids = [i.get("idReadable") for i in issues if i.get("idReadable")]
         first = self._notified is None  # первая загрузка после запуска — ни о чём не уведомляем
@@ -1647,45 +2240,117 @@ class Widget(tk.Tk):
             last = last_comment_time(issue)
             if first or (self._known_ids is not None and iid not in self._known_ids):
                 if not first:
-                    events.append(("new", issue, None))
+                    events.append({"kind": "assigned", "issue": issue})
                 self._notified[iid] = last
                 continue
             base = max(self._notified.get(iid, 0), self.seen.get(iid, 0))
             fresh = [c for c in live_comments(issue) if (c.get("created") or 0) > base
                      and ((c.get("author") or {}).get("login") or "").lower() != me]
             if fresh:
-                events.append(("comment", issue, fresh))
+                events.append(self._comment_event(issue, fresh))
             self._notified[iid] = max(self._notified.get(iid, 0), last)
         self._known_ids = set(ids)
-        if events and self.cfg.get("notify", True):
-            self._show_events(events)
+        return events
+
+    def _comment_event(self, issue, comments):
+        tagged = any(mention_info({"comments": [c]}, self.me_login) for c in comments)
+        return {"kind": "mention" if tagged else "comment", "issue": issue, "comments": comments}
+
+    def _watch_events(self, watched, own_ids):
+        """Задачи под наблюдением: смена статуса и новые комментарии других (если задача не из ваших)."""
+        me = self.me_login.lower()
+        first = self._watch_state is None
+        if first:
+            self._watch_state = {"states": {}, "comments": {}}
+        states, comments = self._watch_state["states"], self._watch_state["comments"]
+        events = []
+        for issue in watched:
+            iid = issue.get("idReadable")
+            if not iid:
+                continue
+            state = field_value(issue, self.cfg["state_field"], "state")[0] or ""
+            last = last_comment_time(issue)
+            if iid not in self.seen:  # впервые видим — старые комментарии не новые
+                self.seen[iid] = last
+            if not first and iid in states:
+                old = states[iid]
+                if old and state and old != state:
+                    events.append({"kind": "status", "issue": issue, "from": old, "to": state})
+                if iid not in own_ids:  # о своих задачах уже сообщили выше
+                    base = max(comments.get(iid, 0), self.seen.get(iid, 0))
+                    fresh = [c for c in live_comments(issue) if (c.get("created") or 0) > base
+                             and ((c.get("author") or {}).get("login") or "").lower() != me]
+                    if fresh:
+                        events.append(self._comment_event(issue, fresh))
+            states[iid], comments[iid] = state, max(comments.get(iid, 0), last)
+        return events
+
+    def _notify_allowed(self, kind):
+        key = {"assigned": "notify_assigned", "comment": "notify_comments", "mention": "notify_mentions",
+               "status": "notify_status"}[kind]
+        return bool(self.cfg.get("notify", True)) and bool(self.cfg.get(key, True))
 
     def _show_events(self, events):
-        if len(events) > 3:  # много событий сразу — одно сводное уведомление
-            n_new = sum(1 for e in events if e[0] == "new")
-            n_com = sum(len(e[2]) for e in events if e[0] == "comment")
-            parts = ([f"новых задач: {n_new}"] if n_new else []) + ([f"новых комментариев: {n_com}"] if n_com else [])
-            show_toast("YouTrack: " + ", ".join(parts),
-                       ", ".join(e[1]["idReadable"] for e in events[:6]) + ("…" if len(events) > 6 else ""),
+        events = [e for e in events if self._notify_allowed(e["kind"])]
+        if not events:
+            return
+        if len(events) > 4:  # много событий сразу — одно сводное уведомление
+            count = lambda k: sum(1 for e in events if e["kind"] == k)
+            parts = [f"{label}: {count(k)}" for k, label in (("mention", "упоминаний"), ("assigned", "новых задач"),
+                                                              ("comment", "комментариев"), ("status", "смен статуса"))
+                     if count(k)]
+            ids = [e["issue"]["idReadable"] for e in events]
+            show_toast("YouTrack: " + ", ".join(parts), ", ".join(ids[:6]) + ("…" if len(ids) > 6 else ""),
                        self.cfg["base_url"].rstrip("/") + "/issues")
             return
-        for kind, issue, comments in events:
+        for e in events:
+            issue = e["issue"]
             iid, summary, url = issue["idReadable"], issue.get("summary") or "", self.issue_url(issue)
-            if kind == "new":
+            if e["kind"] == "assigned":
                 prio = field_value(issue, self.cfg["priority_field"], "priority")[0]
-                show_toast(f"Новая задача · {iid}", summary, url, f"Приоритет: {prio}" if prio else "")
-            else:
-                c = comments[-1]
+                show_toast(f"Назначена задача · {iid}", summary, url, f"Приоритет: {prio}" if prio else "")
+            elif e["kind"] == "status":
+                self._show_status_event(e)
+            elif e.get("comments"):
+                cs = e["comments"]
+                c = cs[-1]
                 who = (c.get("author") or {}).get("fullName") or (c.get("author") or {}).get("login") or ""
-                more = f" (+{len(comments) - 1})" if len(comments) > 1 else ""
-                tagged = mention_info({"comments": [c]}, self.me_login)  # в комментарии упомянули вас?
-                title = "Вас упомянули" if tagged else "Комментарий"
+                more = f" (+{len(cs) - 1})" if len(cs) > 1 else ""
+                title = "Вас упомянули" if e["kind"] == "mention" else "Комментарий"
                 show_toast(f"{title} · {iid}{more}", f"{who}: {comment_snippet(c)}", url, summary)
+            else:  # упоминание из вкладки «Нужно внимание»
+                info = e["info"]
+                show_toast(f"Вас упомянули · {iid}", f"{info['author']}: {comment_snippet({'text': info['text']})}",
+                           url, summary)
+
+    def _show_status_event(self, e):
+        """Кто сменил статус — узнаём у YouTrack в фоне; о своих изменениях не уведомляем."""
+        issue, token, base = e["issue"], unprotect(self.cfg["token_enc"]), self.cfg["base_url"]
+        f = _find_field(issue, self.cfg["state_field"], "state")
+        field = (f or {}).get("name") or self.cfg["state_field"]
+
+        def work():
+            try:
+                author = fetch_status_author(base, token, issue, field, e["to"])
+            except YTError as ex:
+                log_event("WARN", "автор смены статуса", str(ex))
+                author = None
+            self.q.put((self._status_event_ready, (e, author)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _status_event_ready(self, res):
+        e, author = res
+        if author and (author.get("login") or "").lower() == self.me_login.lower():
+            return  # статус сменили вы сами
+        issue = e["issue"]
+        who = (author or {}).get("fullName") or (author or {}).get("login") or ""
+        body = f"{who}: {e['from']} → {e['to']}" if who else f"{e['from']} → {e['to']}"
+        show_toast(f"Статус: {e['to']} · {issue['idReadable']}", body, self.issue_url(issue), issue.get("summary") or "")
 
     # ----- «Нужно внимание»: задачи, где вас упомянули
     def _on_mentions(self, issues):
-        """Новый список упоминаний: запомнить прочитанное, уведомить о новых упоминаниях в чужих задачах."""
-        mine = {i.get("idReadable") for i in self.issues}
+        """Новый список упоминаний: запомнить прочитанное; события об упоминаниях покажем вместе с остальными."""
         first = self._mention_seen is None
         if first:
             self._mention_seen = {}
@@ -1698,22 +2363,30 @@ class Widget(tk.Tk):
                 self.seen[iid] = last_comment_time(issue)
             info = mention_info(issue, self.me_login)
             t = info["time"] if info else 0
-            # о своих задачах уведомит общий механизм комментариев; здесь — только о чужих
-            if not first and t > self._mention_seen.get(iid, 0) and iid not in mine and info and not info["replied"]:
-                events.append((issue, info))
+            if not first and info and t > self._mention_seen.get(iid, 0) and not info["replied"]:
+                events.append({"kind": "mention", "issue": issue, "info": info})
             self._mention_seen[iid] = max(self._mention_seen.get(iid, 0), t)
         save_seen(self.seen)
         self.mentions = issues
-        if events and self.cfg.get("notify", True):
-            if len(events) > 3:
-                show_toast(f"Вас упомянули: {len(events)} задач", ", ".join(e[0]["idReadable"] for e in events[:6]),
-                           self.cfg["base_url"].rstrip("/") + "/issues")
-            else:
-                for issue, info in events:
-                    show_toast(f"Вас упомянули · {issue['idReadable']}",
-                               f"{info['author']}: {comment_snippet({'text': info['text']})}",
-                               self.issue_url(issue), issue.get("summary") or "")
+        self._pending_mention_events = events
         self._update_tabs()
+
+    def _collect_and_show(self, own):
+        """После загрузки: события своих задач + упоминаний в чужих + задач под наблюдением — одним набором."""
+        own_ids = {i.get("idReadable") for i in own}
+        events = self._notify_events(own)
+        watched = getattr(self, "_pending_watched", None)
+        self._pending_watched = None
+        watched_ids = set()
+        if isinstance(watched, list):
+            watched_ids = {i.get("idReadable") for i in watched}
+            events += self._watch_events(watched, own_ids)
+            save_seen(self.seen)
+        # об упоминании в своей задаче или задаче под наблюдением уже сообщили как о комментарии
+        events += [e for e in getattr(self, "_pending_mention_events", [])
+                   if e["issue"].get("idReadable") not in own_ids | watched_ids]
+        self._pending_mention_events = []
+        self._show_events(events)
 
     def attn_waiting(self, issue) -> bool:
         """Упоминание ждёт ответа: вы не ответили комментарием и не отметили вручную «отвечено»."""
@@ -1745,7 +2418,35 @@ class Widget(tk.Tk):
         return issue.get("idReadable") in self.plan
 
     def _save_plan(self):
-        save_plan(self.plan, self.plan_done)
+        save_plan(self.plan, self.plan_done, self.plan_groups, self.plan_group_of)
+
+    # ----- блоки плана на день («Требуется уточнение», «Анализ», …)
+    def group_of(self, iid):
+        gid = self.plan_group_of.get(iid)
+        ids = [g["id"] for g in self.plan_groups]
+        return gid if gid in ids else ids[0]
+
+    def move_to_group(self, issue, gid):
+        """Переместить задачу в блок (если её нет в плане — добавить в план)."""
+        iid = issue.get("idReadable")
+        if not iid or gid not in [g["id"] for g in self.plan_groups]:
+            return
+        if iid not in self.plan:
+            self.plan.append(iid)
+        self.plan_group_of[iid] = gid
+        self._save_plan()
+        self.render(keep_scroll=True)
+
+    def set_groups(self, groups):
+        """Новый список блоков (из окна настройки). Задачи удалённых блоков переходят в первый блок."""
+        groups = [{"id": g["id"], "name": g["name"].strip()[:GROUP_NAME_MAX]} for g in groups if g["name"].strip()]
+        if not groups:
+            groups = [dict(g) for g in DEFAULT_GROUPS]
+        ids = {g["id"] for g in groups}
+        self.plan_groups = groups
+        self.plan_group_of = {k: v for k, v in self.plan_group_of.items() if v in ids}
+        self._save_plan()
+        self.render(keep_scroll=True)
 
     def toggle_done(self, issue):
         """Галочка «сделано сегодня» в плане на день (в YouTrack ничего не меняется)."""
@@ -1829,6 +2530,10 @@ class Widget(tk.Tk):
             self.clear_plan_btn.pack(side="right")
         else:
             self.clear_plan_btn.pack_forget()
+        if cur == "day":
+            self.groups_btn.pack(side="right", padx=(0, 4))
+        else:
+            self.groups_btn.pack_forget()
         # фильтр по приоритету/спринту к своим задачам не относится — на «Срочных» вместо него кнопки
         if getattr(self, "search_box", None) is not None:
             if cur == "urgent":
@@ -1882,12 +2587,22 @@ class Widget(tk.Tk):
                     if mq:
                         try:
                             self.q.put(("mentions", fetch_issues(cfg["base_url"], token, mq, 100)))
-                        except YTError:
-                            pass  # основной список важнее — упоминания подтянутся при следующем обновлении
+                        except YTError as e:  # основной список важнее — упоминания подтянутся при следующем обновлении
+                            log_event("WARN", "запрос упоминаний", str(e))
+                    # задачи под наблюдением — только для уведомлений (смена статуса, новые комментарии)
+                    wq = (cfg.get("watch_query") or "").strip()
+                    if wq:
+                        try:
+                            self.q.put(("watched", fetch_issues(cfg["base_url"], token, wq, 100)))
+                        except YTError as e:
+                            log_event("WARN", "запрос задач под наблюдением", str(e))
+                            self.q.put(("watched", e))
                     self.q.put(("issues", data))
                 except YTError as e:
+                    log_event("WARN", "обновление списка", str(e))
                     self.q.put(("error", str(e)))
                 except Exception as e:  # noqa
+                    log_event("ERROR", "обновление списка", f"{type(e).__name__}: {e}", e)
                     self.q.put(("error", f"Ошибка: {e}"))
 
             threading.Thread(target=work, daemon=True).start()
@@ -1900,7 +2615,7 @@ class Widget(tk.Tk):
                 kind, payload = self.q.get_nowait()
                 if kind == "issues":
                     self.loading = False
-                    self._notify_events(payload)
+                    self._collect_and_show(payload)
                     self.issues = payload
                     self._message = None
                     # задачи, которые видим впервые: уже существующие комментарии считаем прочитанными
@@ -1923,6 +2638,9 @@ class Widget(tk.Tk):
                         self.render(keep_scroll=True)
                 elif kind == "mentions":
                     self._on_mentions(payload)
+                elif kind == "watched":  # список задач под наблюдением (или ошибка запроса)
+                    self._pending_watched = payload
+                    self.watch_error = str(payload) if isinstance(payload, Exception) else ""
                 elif kind == "error":
                     self.loading = False
                     suffix = f" · данные от {self.last_ok}" if self.last_ok else ""
@@ -1953,6 +2671,7 @@ class Widget(tk.Tk):
 
     def _clear(self):
         self.canvas.delete("all")
+        self._detail_by_index = {}
         self.card_items = {}
         self._hover = None
         self._hover_title = None
@@ -2110,8 +2829,10 @@ class Widget(tk.Tk):
                                                           -((mention_info(i, self.me_login) or {}).get("time") or 0)))
         if tab == "day":  # порядок — как расставил пользователь, выполненные — в конец
             order = {iid: n for n, iid in enumerate(self.plan)}
+            gorder = {g["id"]: n for n, g in enumerate(self.plan_groups)}
             issues = sorted((i for i in self._all_issues() if self.in_plan(i)),
-                            key=lambda i: (i.get("idReadable") in self.plan_done, order.get(i.get("idReadable"), 0)))
+                            key=lambda i: (gorder[self.group_of(i.get("idReadable"))],
+                                           i.get("idReadable") in self.plan_done, order.get(i.get("idReadable"), 0)))
         for issue in issues:
             if tab == "day" and not self.in_plan(issue):
                 continue
@@ -2128,6 +2849,7 @@ class Widget(tk.Tk):
                 "prio": prio, "prio_colors": chip_colors(prio, prio_color) if prio else None,
                 "due": due,
                 "done": tab == "day" and issue.get("idReadable") in self.plan_done,
+                "group": self.group_of(issue.get("idReadable")) if tab == "day" else None,
                 "sprints": sprints_of(issue, self.cfg.get("sprint_field", "")),
                 "has_sprint": sprint_field_of(issue, self.cfg.get("sprint_field", "")) is not None,
                 "bar": chip_colors(prio, prio_color)[0] if prio else "#3a3a3a",
@@ -2211,7 +2933,34 @@ class Widget(tk.Tk):
         wrap = max(80, side_x - tx - 6)              # ширина переноса названия
         y = 0
         heights = self.__dict__.setdefault("_card_heights", {})
-        for i, card in enumerate(self.visible):
+        self._sections = []  # блоки вкладки «День»: {"gid", "top", "bottom", "cards": [индексы карточек]}
+        if self._day_mode:  # карточки уже отсортированы по блокам — рисуем блок за блоком
+            show_heads = len(self.plan_groups) > 1
+            by_gid = {}
+            for i, card in enumerate(self.visible):
+                by_gid.setdefault(card.get("group"), []).append(i)
+            stop = False
+            for gi, g in enumerate(self.plan_groups):
+                idxs = by_gid.get(g["id"], [])
+                sec = {"gid": g["id"], "top": y, "cards": idxs}
+                if show_heads:
+                    y = self._draw_group_head(gi, g, len(idxs), x0, x1, y)
+                for i in idxs:
+                    if limit_y is not None and y > limit_y:  # быстрый режим ресайза — остальное по прошлой высоте
+                        y += sum(heights.get(cd["id"], 110) + self.CARD_GAP for cd in self.visible[i:])
+                        stop = True
+                        break
+                    bottom = self._draw_card(i, self.visible[i], x0, x1, y, tx, wrap, side_x)
+                    heights[self.visible[i]["id"]] = bottom - y
+                    self._card_bounds.append((y, bottom))
+                    y = bottom + self.CARD_GAP
+                if stop:
+                    break
+                if not idxs and show_heads:
+                    y = self._draw_group_empty(gi, x0, x1, y)
+                sec["bottom"] = y
+                self._sections.append(sec)
+        for i, card in enumerate(self.visible if not self._day_mode else []):
             if limit_y is not None and y > limit_y:
                 # остальные карточки пока не рисуем — берём их высоту из прошлой раскладки
                 y += sum(heights.get(cd["id"], 110) + self.CARD_GAP for cd in self.visible[i:])
@@ -2224,6 +2973,29 @@ class Widget(tk.Tk):
         total = max(y, visible_h)  # короткий список не «плавает»: область прокрутки не меньше окна
         c.configure(scrollregion=(0, 0, width, total))
         c.yview_moveto(min(max(0, top), max(0, total - visible_h)) / total if total else 0)
+
+    def _draw_group_head(self, gi, g, count, x0, x1, y):
+        """Заголовок блока плана на день: название, число задач и линия до правого края."""
+        c = self.canvas
+        top = y + (6 if gi else 2)
+        name = c.create_text(x0 + 4, top, text=g["name"], fill=BG_TEXT, font=self.f_small_bold, anchor="nw",
+                             tags=("ghead",))
+        cnt = c.create_text(c.bbox(name)[2] + 6, top, text=str(count) if count else "", fill=BG_SUB,
+                            font=self.f_small, anchor="nw", tags=("ghead",))
+        mid = (c.bbox(name)[1] + c.bbox(name)[3]) / 2
+        c.create_line((c.bbox(cnt)[2] if count else c.bbox(name)[2]) + 8, mid, x1, mid,
+                      fill=_mix(BG, "#ffffff", 0.15) if _lum(BG) < 0.5 else _mix(BG, "#000000", 0.15),
+                      tags=("ghead",))
+        return c.bbox(name)[3] + 6
+
+    def _draw_group_empty(self, gi, x0, x1, y):
+        """Пустой блок: пунктирная зона, куда можно перетащить задачу."""
+        c = self.canvas
+        h = 34
+        c.create_rectangle(x0 + 2, y, x1 - 2, y + h, outline=BG_SUB, dash=(3, 3), tags=("gempty",))
+        c.create_text((x0 + x1) / 2, y + h / 2, text="Перетащите задачу сюда" if self._can_drag() else "Нет задач",
+                      fill=BG_SUB, font=self.f_small, tags=("gempty",))
+        return y + h + self.CARD_GAP
 
     def _draw_local_card(self, i, card, x0, x1, y, tx, wrap, side_x):
         """Карточка своей срочной задачи: галочка, время создания, название, текст; справа — изменить/удалить."""
@@ -2350,36 +3122,26 @@ class Widget(tk.Tk):
         return bottom
 
     def _draw_details(self, i, card, lx, rx, y, t):
-        """Раскрытая часть карточки: описание + 3 последних комментария + ссылка «Открыть в YouTrack»."""
+        """Раскрытая карточка (клик по облачку): описание и все комментарии задачи с оформлением как в YouTrack.
+        Текст — встроенное поле tk.Text (можно выделять и копировать), высота подгоняется под содержимое."""
         c = self.canvas
         width = max(80, rx - lx)
         c.create_line(lx, y, rx, y, fill=CARD_HOVER if _lum(CARD) < 0.5 else "#d9dce1", tags=(t,))
         y += 8
-        c.create_text(lx, y, text="Описание", fill=SUB, font=self.f_small_bold, anchor="nw", tags=(t,))
-        y += self.line_small + 3
-        desc = self.details.get(card["id"])
-        if card["id"] not in self.details or desc is None:
-            text, color = "Загрузка…", SUB
-        elif isinstance(desc, Exception):
-            text, color = f"Не удалось загрузить: {desc}", ERR
+        iid = card["id"]
+        data = self.details.get(iid)
+        if iid not in self.details or data is None:
+            item = c.create_text(lx, y, text="Загрузка…", fill=SUB, font=self.f_body, anchor="nw", tags=(t,))
+            y = c.bbox(item)[3] + 10
+        elif isinstance(data, Exception):
+            item = c.create_text(lx, y, text=f"Не удалось загрузить: {data}", fill=ERR, font=self.f_body,
+                                 anchor="nw", width=width, tags=(t,))
+            y = c.bbox(item)[3] + 10
         else:
-            text = clean_markdown(desc, 700) or "Нет описания"
-            color = TEXT if desc.strip() else SUB
-        item = c.create_text(lx, y, text=text, fill=color, font=self.f_body, anchor="nw", width=width, tags=(t,))
-        y = c.bbox(item)[3] + 10
-        comments = live_comments(card["issue"])[-3:][::-1]  # три последних, новые сверху
-        c.create_text(lx, y, text="Последние комментарии" if comments else "Комментариев нет",
-                      fill=SUB, font=self.f_small_bold, anchor="nw", tags=(t,))
-        y += self.line_small + 4
-        for cm in comments:
-            who = (cm.get("author") or {}).get("fullName") or (cm.get("author") or {}).get("login") or ""
-            when = time.strftime("%d.%m %H:%M", time.localtime((cm.get("created") or 0) / 1000))
-            head = c.create_text(lx, y, text=who, fill=TEXT, font=self.f_small_bold, anchor="nw", tags=(t,))
-            c.create_text(c.bbox(head)[2] + 6, y, text=when, fill=SUB, font=self.f_small, anchor="nw", tags=(t,))
-            y += self.line_small + 2
-            body = c.create_text(lx, y, text=clean_markdown(cm.get("text") or "", 400) or "—", fill=TEXT,
-                                 font=self.f_body, anchor="nw", width=width, tags=(t,))
-            y = c.bbox(body)[3] + 8
+            widget, height = self._detail_widget(iid, data, width)
+            c.create_window(lx, y, window=widget, anchor="nw", width=width, height=height, tags=(t, f"d{i}"))
+            self._detail_by_index[i] = widget
+            y += height + 8
         # «Написать комментарий» (окно в виджете) и «Открыть в YouTrack» (браузер)
         icon_font = (ICON_FAMILY, max(9, FS - 1)) if ICON_OK else self.f_small
         reply_icon = c.create_text(lx, y + 1, text=ic("add_comment"), fill=ACCENT, font=icon_font, anchor="nw",
@@ -2395,6 +3157,111 @@ class Widget(tk.Tk):
             for item in c.find_withtag(f"o{i}"):
                 c.move(item, lx - c.bbox(link)[0], dy)
         return max(c.bbox(item)[3] for item in c.find_withtag(f"o{i}")) + 10
+
+    def _detail_widget(self, iid, data, width):
+        """Встроенное поле с размеченным содержимым задачи: создаётся один раз на данные, высота — по ширине."""
+        cache = self._detail_cache.get(iid)
+        if cache is None or cache["data"] is not data or not cache["widget"].winfo_exists():
+            if cache is not None and cache["widget"].winfo_exists():
+                cache["widget"].destroy()
+            t = tk.Text(self.canvas, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat", bd=0,
+                        highlightthickness=0, wrap="word", padx=0, pady=0, cursor="arrow")
+            self._render_details(t, data, iid)
+            # колесо мыши над текстом прокручивает список, а не поле
+            t.bind("<MouseWheel>", lambda e: (self._on_wheel(e), "break")[1])
+            cache = {"widget": t, "data": data, "heights": {}}
+            self._detail_cache[iid] = cache
+        height = cache["heights"].get(width)
+        if height is None:  # высоту узнаем после отрисовки (нужна реальная ширина) — пока примерная
+            height = cache.get("last", 160)
+            self._detail_fit.add(iid)
+            if not self._detail_fit_job:
+                self._detail_fit_job = self.after_idle(self._fit_details)
+        return cache["widget"], height
+
+    def _fit_details(self):
+        """Подогнать высоту встроенных полей под содержимое и при изменении перерисовать список (один проход)."""
+        self._detail_fit_job = None
+        changed = False
+        for iid in list(self._detail_fit):
+            cache = self._detail_cache.get(iid)
+            if not cache or not cache["widget"].winfo_exists() or not cache["widget"].winfo_ismapped():
+                continue
+            t = cache["widget"]
+            width = t.winfo_width()
+            res = t.count("1.0", "end", "update", "ypixels")
+            h = (res[0] if isinstance(res, tuple) else res) or 0
+            h = max(20, int(h) + 4)
+            cache["heights"][width] = h
+            cache["last"] = h
+            self._detail_fit.discard(iid)
+            changed = True
+        if changed:
+            self._draw_cards(keep_scroll=True)
+
+    def _render_details(self, t, data, iid):
+        """Описание и все комментарии (новые сверху) с разметкой YouTrack; каждый комментарий — в своём «облачке»
+        (подложка другого оттенка с полями по краям), как в мобильном приложении."""
+        size = max(9, FS - 1)
+        dark = _lum(CARD) < 0.5
+        bubble = _mix(CARD, "#ffffff", 0.07) if dark else _mix(CARD, "#000000", 0.05)
+        code_desc = _mix(CARD, "#ffffff", 0.07) if dark else _mix(CARD, "#000000", 0.06)
+        code_bub = _mix(bubble, "#ffffff", 0.08) if dark else _mix(bubble, "#000000", 0.07)
+        pad = 12
+        # «облачко» создаётся первым — самый низкий приоритет: даёт фон и цвет полей, не перебивая разметку
+        t.tag_configure("bubble", background=bubble, lmargincolor=bubble, rmargincolor=bubble)
+        t.tag_configure("section", font=(FONT, max(8, FS - 2), "bold"), foreground=SUB, spacing1=6, spacing3=3)
+        t.tag_configure("muted", font=(FONT, size), foreground=SUB)
+        t.tag_configure("c_who", font=(FONT, size, "bold"), foreground=TEXT, lmargin1=pad, lmargin2=pad, rmargin=pad)
+        t.tag_configure("c_when", font=(FONT, max(8, FS - 2)), foreground=SUB)
+        t.tag_configure("c_pad", font=(FONT, 4), lmargin1=pad)       # поле сверху и снизу внутри облачка
+        t.tag_configure("between", font=(FONT, 5))                     # промежуток между облачками
+        colors = {"text": TEXT, "sub": SUB, "accent": ACCENT}
+        open_url = lambda u: os.startfile(u or f"{self.cfg['base_url'].rstrip('/')}/issue/{iid}")
+        md = MarkdownRenderer(t, self.cfg["base_url"], open_url=open_url, colors=dict(colors, code_bg=code_desc),
+                              size=size)
+        mdc = MarkdownRenderer(t, self.cfg["base_url"], open_url=open_url, colors=dict(colors, code_bg=code_bub),
+                               size=size, prefix="c_", margin=pad)
+        use_md = bool(self.cfg.get("markdown", True))
+
+        def put(r, text):
+            if not text or not text.strip():
+                t.insert("end", "—\n", (r.k("p"),))
+            elif use_md:
+                try:
+                    r.render(text.strip("\n"))
+                except Exception as ex:  # noqa — не ломаем карточку из-за разметки
+                    log_event("ERROR", "оформление текста", f"{type(ex).__name__}: {ex}", ex)
+                    t.insert("end", clean_markdown(text, 100_000) + "\n", (r.k("p"),))
+            else:
+                t.insert("end", text.strip("\n") + "\n", (r.k("p"),))
+
+        t.insert("end", "Описание\n", "section")
+        desc = data.get("description") if isinstance(data, dict) else data
+        if desc and desc.strip():
+            put(md, desc)
+        else:
+            t.insert("end", "Нет описания\n", "muted")
+        cs = sorted((c for c in (data.get("comments") if isinstance(data, dict) else None) or [] if not c.get("deleted")),
+                    key=lambda c: c.get("created") or 0, reverse=True)
+        t.insert("end", f"Комментарии ({len(cs)})\n" if cs else "Комментариев нет\n", "section")
+        for c in cs:
+            start = t.index("end-1c")
+            t.insert("end", "\n", "c_pad")
+            a = c.get("author") or {}
+            t.insert("end", (a.get("fullName") or a.get("login") or "") + "  ", "c_who")
+            t.insert("end", time.strftime("%d.%m.%Y %H:%M", time.localtime((c.get("created") or 0) / 1000)) + "\n",
+                     ("c_who", "c_when"))
+            put(mdc, c.get("text") or "")
+            while t.get("end-2c", "end-1c") == "\n" and "c_gap" in t.tag_names("end-2c"):
+                t.delete("end-2c", "end-1c")  # пустые строки в конце комментария не раздувают облачко
+            t.insert("end", "\n", "c_pad")
+            t.tag_add("bubble", start, "end-1c")
+            t.insert("end", "\n", "between")
+        # убрать завершающий перевод строки, чтобы не было лишнего места внизу
+        if t.get("end-2c", "end-1c") == "\n":
+            t.delete("end-2c", "end-1c")
+        t.configure(state="disabled")  # только чтение; выделять и копировать (Ctrl+C, правый клик) можно
 
     def _draw_badge(self, iid, count):
         """Красный кружок с числом новых комментариев на значке chat_bubble_outline."""
@@ -2436,6 +3303,10 @@ class Widget(tk.Tk):
                 break
         if card is None or card >= len(self.visible):
             return None, None
+        if role is None:  # промежуток между словами многострочного названия — тоже клик по названию
+            box = c.bbox(f"t{card}")
+            if box and box[0] <= x <= box[2] and box[1] <= y <= box[3]:
+                role = "t"
         return card, role
 
     def _on_motion(self, e):
@@ -2456,6 +3327,9 @@ class Widget(tk.Tk):
                     continue
                 for item in c.find_withtag(f"c{idx}&&bg"):
                     c.itemconfigure(item, fill=color)
+                emb = self._detail_by_index.get(idx)
+                if emb is not None and emb.winfo_exists():
+                    emb.configure(bg=color)
                 for ring in c.find_withtag(f"c{idx}&&badge_ring"):
                     c.itemconfigure(ring, outline=color)
             self._hover = card
@@ -2497,15 +3371,19 @@ class Widget(tk.Tk):
         d = self._drag
         c.move(f"c{d['card']}", 0, y - d["last_y"])  # карточка едет за мышью
         d["last_y"] = y
-        # куда вставим: по середине карточек
-        target = len(self._card_bounds)
-        for n, (top, bottom) in enumerate(self._card_bounds):
-            if y < (top + bottom) / 2:
-                target = n
-                break
-        d["target"] = target
-        line_y = (self._card_bounds[target][0] - self.CARD_GAP / 2 if target < len(self._card_bounds)
-                  else self._card_bounds[-1][1] + self.CARD_GAP / 2)
+        # куда вставим: блок под курсором и место между его карточками (по середине карточек)
+        secs = self._sections or [{"gid": None, "top": 0, "bottom": 10 ** 9,
+                                   "cards": list(range(len(self._card_bounds)))}]
+        sec = next((sc for sc in secs if y <= sc["bottom"]), secs[-1])
+        bounds = self._card_bounds
+        before = next((n for n in sec["cards"] if n < len(bounds) and y < (bounds[n][0] + bounds[n][1]) / 2), None)
+        d["gid"], d["before"] = sec["gid"], before
+        if before is not None:
+            line_y = bounds[before][0] - self.CARD_GAP / 2
+        elif sec["cards"]:
+            line_y = bounds[sec["cards"][-1]][1] + self.CARD_GAP / 2
+        else:  # пустой блок — линия посередине пунктирной зоны
+            line_y = (sec["top"] + sec["bottom"]) / 2 + 8
         if d["line"]:
             c.coords(d["line"], 0, line_y, self._layout_width - self.RIGHT_M, line_y)
         else:
@@ -2524,10 +3402,20 @@ class Widget(tk.Tk):
             d, self._drag = self._drag, None
             self.canvas.configure(cursor="")
             ids = [cd["id"] for cd in self.visible]
-            src, target = d["card"], d.get("target", d["card"])
-            moved = ids.pop(src)
-            ids.insert(target - 1 if target > src else target, moved)
-            self.move_in_plan(ids)
+            moved = ids[d["card"]]
+            gid = d.get("gid") or self.group_of(moved)
+            before = d.get("before")
+            new = [x for x in ids if x != moved]
+            if before is not None and ids[before] != moved:
+                pos = new.index(ids[before])
+            elif before is not None:  # отпустили на прежнее место
+                pos = ids.index(moved)
+            else:  # в конец блока (или в пустой блок)
+                members = [n for n, x in enumerate(new) if self.group_of(x) == gid]
+                pos = members[-1] + 1 if members else len(new)
+            new.insert(pos, moved)
+            self.plan_group_of[moved] = gid
+            self.move_in_plan(new)
             return
         if not press or press[0] is None:
             return
@@ -2544,7 +3432,7 @@ class Widget(tk.Tk):
                 self.delete_urgent(item)
             return
         issue = self.visible[card]["issue"]
-        if role in ("t", "o"):
+        if role in ("t", "o"):  # название и «Открыть в YouTrack» — задача в браузере
             self.open_issue(issue)
         elif role == "i":
             self.toggle_details(issue)
@@ -2569,18 +3457,28 @@ class Widget(tk.Tk):
             self.mark_read(issue, render=False)  # комментарии посмотрели прямо в виджете
             self._update_header_count()
             if iid not in self.details or isinstance(self.details.get(iid), Exception):
-                self.details[iid] = None  # загружается
-                token, base = unprotect(self.cfg["token_enc"]), self.cfg["base_url"]
-
-                def work():
-                    try:
-                        res = fetch_description(base, token, issue)
-                    except Exception as ex:  # noqa
-                        res = YTError(str(ex))
-                    self.q.put((self._details_loaded, (iid, res)))
-
-                threading.Thread(target=work, daemon=True).start()
+                self._load_details(issue)
         self._draw_cards(keep_scroll=True)
+
+    def _load_details(self, issue):
+        """Загрузить описание и все комментарии задачи для раскрытой карточки."""
+        iid = issue.get("idReadable")
+        if self.details.get(iid) is None:
+            self.details[iid] = None  # загружается
+        token, base = unprotect(self.cfg["token_enc"]), self.cfg["base_url"]
+
+        def work():
+            try:
+                res = fetch_full(base, token, issue)
+            except YTError as ex:
+                log_event("WARN", "содержимое задачи", str(ex))
+                res = ex
+            except Exception as ex:  # noqa
+                log_event("ERROR", "содержимое задачи", f"{type(ex).__name__}: {ex}", ex)
+                res = YTError(str(ex))
+            self.q.put((self._details_loaded, (iid, res)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _details_loaded(self, res):
         iid, data = res
@@ -2788,8 +3686,22 @@ class Widget(tk.Tk):
         t_text.grid(row=2, column=0, sticky="we")
         if drafts.get(iid):
             t_text.insert("1.0", drafts[iid])
-        err = tk.Label(win, text="", bg=BG_, fg=ERR, font=(FONT, 9), anchor="w", justify="left", wraplength=400)
-        err.grid(row=3, column=0, sticky="we", pady=(6, 0))
+        err = tk.Label(win, text="", bg=BG_, fg=ERR, font=(FONT, 9), anchor="w", justify="left", wraplength=330)
+        err.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        cnt = tk.Label(win, text="", bg=BG_, fg=SUB_, font=(FONT, 8))
+        cnt.grid(row=3, column=0, sticky="ne", pady=(6, 0))
+
+        def on_comment_text(_=None):  # не длиннее COMMENT_MAX (как в Android-версии), в том числе при вставке
+            s = t_text.get("1.0", "end-1c")
+            if len(s) > COMMENT_MAX:
+                t_text.delete(f"1.0+{COMMENT_MAX}c", "end")
+                self.bell()
+                s = s[:COMMENT_MAX]
+            cnt.configure(text=f"{len(s)}/{COMMENT_MAX}", fg="#ef6c00" if len(s) >= COMMENT_MAX - 500 else SUB_)
+            t_text.edit_modified(False)
+
+        t_text.bind("<<Modified>>", on_comment_text)
+        on_comment_text()
         tk.Label(win, text="Ctrl+V или правый клик — вставить из буфера. Ctrl+Enter — отправить, Esc — закрыть (текст сохранится как черновик). "
                            "Поддерживается разметка YouTrack, @логин — упомянуть коллегу.",
                  bg=BG_, fg=SUB_, font=(FONT, 8), justify="left", wraplength=400).grid(row=4, column=0, sticky="w")
@@ -2874,6 +3786,7 @@ class Widget(tk.Tk):
             self.toggle_details(issue)
             self.expanded.add(iid)
         self.status_lbl.configure(text=f"{iid}: комментарий добавлен", fg=BG_SUB)
+        self._load_details(issue)  # перечитать содержимое раскрытой карточки — новый комментарий будет в нём
         self._data_sig = None  # следующее обновление перерисует список с данными сервера
         self.render(keep_scroll=True)
 
@@ -2959,14 +3872,19 @@ class Widget(tk.Tk):
     FIELD_MENUS = {"a": ("state", "статус"), "p": ("priority", "приоритет"), "r": ("sprint", "спринт")}
 
     def open_field_menu(self, card_index, role):
-        kind, what = self.FIELD_MENUS[role]
         issue = self.visible[card_index]["issue"]
-        field_name = {"state": self.cfg["state_field"], "priority": self.cfg["priority_field"],
-                      "sprint": self.cfg.get("sprint_field", "")}[kind]
         c = self.canvas
         box = c.bbox(f"{role}{card_index}")
         x = c.winfo_rootx() + int(box[0] - c.canvasx(0))
         y = c.winfo_rooty() + int(box[3] - c.canvasy(0)) + 2
+        self.popup_field_menu(issue, role, x, y)
+
+    def popup_field_menu(self, issue, role, x, y):
+        """Список значений поля из YouTrack (статус / приоритет / спринт) в точке экрана x, y."""
+        kind, what = self.FIELD_MENUS[role]
+        field_name = {"state": self.cfg["state_field"], "priority": self.cfg["priority_field"],
+                      "sprint": self.cfg.get("sprint_field", "")}[kind]
+        c = self.canvas
         self.configure(cursor="watch")
         c.configure(cursor="watch")
         self.update_idletasks()
@@ -3001,10 +3919,29 @@ class Widget(tk.Tk):
                 m.add_command(label=text, command=lambda c_=cmd, l_=done_label: self.change_field(issue, what, l_, c_))
         m.tk_popup(x, y)
 
+    def _fill_group_menu(self):
+        m = self.group_menu
+        m.delete(0, "end")
+        issue = self.menu_issue
+        if not issue:
+            return
+        iid = issue.get("idReadable")
+        cur = self.group_of(iid) if iid in self.plan else None
+        for g in self.plan_groups:
+            m.add_command(label=("✓ " if g["id"] == cur else "    ") + g["name"],
+                          command=lambda gid=g["id"]: self.move_to_group(issue, gid))
+        m.add_separator()
+        m.add_command(label="Настроить блоки…", command=self.open_groups_editor)
+
     def _card_menu(self, e, issue):
         self.menu_issue = issue
         self.menu.entryconfigure(self.menu_plan_index, label="Убрать из плана на день" if self.in_plan(issue)
                                  else "Добавить в план на день")
+        iid = issue.get("idReadable")
+        movable = self.cfg.get("tab") == "day" and self._can_drag()
+        for off, delta in ((0, -1), (1, 1)):
+            ok = movable and self._plan_step_possible(iid, delta)
+            self.menu.entryconfigure(self.menu_up_index + off, state="normal" if ok else "disabled")
         self._prefetch_states(issue)
         self.menu.tk_popup(e.x_root, e.y_root)
 
@@ -3079,14 +4016,48 @@ class Widget(tk.Tk):
         v_notify = tk.BooleanVar(value=bool(self.cfg.get("notify", True)))
         notify_row = tk.Frame(opts, bg=BG)
         notify_row.pack(anchor="w", fill="x")
-        tk.Checkbutton(notify_row, text="Уведомления Windows о новых задачах и комментариях",
-                       variable=v_notify, **cb).pack(side="left")
+        tk.Checkbutton(notify_row, text="Уведомления Windows", variable=v_notify, **cb).pack(side="left")
         test_toast = tk.Label(notify_row, text="проверить", bg=BG, fg=ACCENT_DLG, font=(FONT, 8, "underline"),
                               cursor="hand2")
         test_toast.pack(side="left", padx=(4, 0))
         test_toast.bind("<Button-1>", lambda e: show_toast(
             "YouTrack Widget", "Так будут выглядеть уведомления о новых задачах и комментариях.",
             self.cfg.get("base_url", ""), "Клик по уведомлению откроет задачу в браузере"))
+        # уведомления по видам — каждое включается отдельно (как в Android-версии)
+        kinds = tk.Frame(opts, bg=BG)
+        kinds.pack(anchor="w", padx=(22, 0))
+        v_kinds = {}
+        for n, (key, text) in enumerate((("notify_mentions", "вас упомянули через @"),
+                                         ("notify_comments", "новый комментарий"),
+                                         ("notify_status", "смена статуса (под наблюдением)"),
+                                         ("notify_assigned", "назначена новая задача"))):
+            v_kinds[key] = tk.BooleanVar(value=bool(self.cfg.get(key, True)))
+            tk.Checkbutton(kinds, text=text, variable=v_kinds[key], **cb).grid(row=n // 2, column=n % 2, sticky="w",
+                                                                              padx=(0, 12))
+        queries = tk.Frame(opts, bg=BG)
+        queries.pack(anchor="w", fill="x", pady=(4, 0))
+        tk.Label(queries, text="Задачи под наблюдением — уведомления о смене статуса и комментариях "
+                               "(пусто — выключено)", bg=BG, fg=TEXT, font=(FONT, 9)).pack(anchor="w")
+        e_watch = tk.Entry(queries, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10))
+        e_watch.insert(0, self.cfg.get("watch_query", ""))
+        e_watch.pack(fill="x", ipady=3)
+        if self.watch_error:
+            tk.Label(queries, text=f"Ошибка запроса: {self.watch_error}", bg=BG, fg=ERR, font=(FONT, 8),
+                     wraplength=420, justify="left").pack(anchor="w")
+        tk.Label(queries, text="Запрос вкладки «Нужно внимание»", bg=BG, fg=TEXT, font=(FONT, 9)).pack(
+            anchor="w", pady=(4, 0))
+        e_ment = tk.Entry(queries, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10))
+        e_ment.insert(0, self.cfg.get("mentions_query", ""))
+        e_ment.pack(fill="x", ipady=3)
+        v_md = tk.BooleanVar(value=bool(self.cfg.get("markdown", True)))
+        md_row = tk.Frame(opts, bg=BG)
+        md_row.pack(anchor="w", fill="x", pady=(4, 0))
+        tk.Checkbutton(md_row, text="Оформление текста как в YouTrack (полный просмотр задачи)", variable=v_md,
+                       **cb).pack(side="left")
+        log_link = tk.Label(md_row, text="Журнал ошибок…", bg=BG, fg=ACCENT_DLG, font=(FONT, 8, "underline"),
+                            cursor="hand2")
+        log_link.pack(side="right")
+        log_link.bind("<Button-1>", lambda e: self.open_log_window())
         v_tray = tk.BooleanVar(value=bool(self.cfg.get("tray", True)))
         tk.Checkbutton(opts, text="Значок в трее со счётчиком комментариев (✕ прячет виджет в трей)",
                        variable=v_tray, **cb).pack(anchor="w")
@@ -3209,7 +4180,9 @@ class Widget(tk.Tk):
                             priority_field=e_pf.get().strip() or "Priority",
                             refresh_min=rm, topmost=v_top.get(), alpha=round(v_alpha.get(), 2),
                             bg_color=v_bg.get(), card_color=v_card.get(), font_size=font_size(),
-                            notify=v_notify.get(), tray=v_tray.get())
+                            notify=v_notify.get(), tray=v_tray.get(),
+                            watch_query=e_watch.get().strip(), mentions_query=e_ment.get().strip(),
+                            markdown=v_md.get(), **{k: v.get() for k, v in v_kinds.items()})
             hk = e_hk.get().strip()
             if hk and not parse_hotkey(hk):
                 messagebox.showwarning("Горячая клавиша", f"Не понял сочетание «{hk}».\n"
@@ -3236,6 +4209,7 @@ class Widget(tk.Tk):
             self._notified = None   # после смены запроса не считаем «старые» задачи новыми
             self._known_ids = None
             self._mention_seen = None
+            self._watch_state = None
             self.refresh()
 
         def font_size():
@@ -3252,6 +4226,8 @@ class Widget(tk.Tk):
 
         btns = tk.Frame(win, bg=BG)
         btns.grid(row=12, column=0, sticky="e", pady=(12, 0))
+        tk.Label(win, text=f"Версия приложения: {VERSION}", bg=BG, fg=SUB, font=(FONT, 8)).grid(
+            row=13, column=0, sticky="w", pady=(10, 0))
         bstyle = dict(relief="flat", font=(FONT, 9), padx=12, pady=4, cursor="hand2", bd=0)
         tk.Button(btns, text="Проверить", command=test, bg=CARD, fg=TEXT, activebackground=CARD_HOVER,
                   activeforeground=TEXT, **bstyle).pack(side="left", padx=4)
@@ -3276,6 +4252,7 @@ def main():
     q = queue.Queue()
     if not acquire_single_instance(q):
         return  # уже запущен — попросили его показаться
+    install_crash_logging()
     load_icon_font()
     register_toast_app()
     Widget(q).mainloop()

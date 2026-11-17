@@ -144,6 +144,61 @@ class ModelTest {
         assertEquals(listOf("A", "B", "C"), ordered.map { it.idReadable })
     }
 
+    private val groups = listOf(PlanGroup("a", "На сегодня"), PlanGroup("b", "Требуется уточнение"), PlanGroup("c", "Анализ"))
+
+    @Test fun planGroupsStorageAndDefaults() {
+        assertEquals(PlanGroups.DEFAULT, PlanGroups.parse(null))
+        assertEquals(PlanGroups.DEFAULT, PlanGroups.parse("[{\"id\":\"x\",\"name\":\"  \"}]"))
+        assertEquals(groups, PlanGroups.parse(PlanGroups.toJson(groups)))
+        assertEquals(mapOf("A" to "b"), PlanGroups.parseOf(PlanGroups.ofToJson(mapOf("A" to "b"))))
+        assertEquals("a", PlanGroups.groupOf("A", groups, mapOf("A" to "deleted")))
+        assertEquals("b", PlanGroups.groupOf("A", groups, mapOf("A" to "b")))
+    }
+
+    @Test fun planOrderByGroups() {
+        val list = listOf("A", "B", "C", "D").map { parse(issue(it)) }
+        val ordered = Model.planOrder(list, listOf("A", "B", "C", "D"), setOf("C"), groups, mapOf("A" to "c", "B" to "b", "D" to "b"))
+        assertEquals(listOf("C", "B", "D", "A"), ordered.map { it.idReadable })  // «C» сделана, но в первом блоке
+    }
+
+    @Test fun planDropBetweenGroups() {
+        val of = mapOf("B" to "b")
+        // в пустой блок «Анализ»
+        var (order, newOf) = PlanGroups.drop(listOf("A", "C", "B"), groups, of, "A", "c", null)
+        assertEquals(listOf("C", "B", "A"), order)
+        assertEquals("c", newOf["A"])
+        // в блок «Требуется уточнение» перед B
+        PlanGroups.drop(order, groups, newOf, "C", "b", "B").let { order = it.first; newOf = it.second }
+        assertEquals(listOf("C", "B", "A"), order)
+        assertEquals("b", newOf["C"])
+        // отпустили на месте
+        assertEquals(listOf("C", "B", "A"), PlanGroups.drop(order, groups, newOf, "B", "b", "B").first)
+    }
+
+    @Test fun planStepCrossesGroups() {
+        val of = mapOf("B" to "b", "C" to "c")
+        val order = listOf("A", "B", "C")
+        assertNull(PlanGroups.step(order, groups, of, "A", -1))  // первая задача первого блока
+        val (o1, of1) = PlanGroups.step(order, groups, of, "B", 1)!!  // в начало «Анализа»
+        assertEquals(listOf("A", "B", "C"), o1)
+        assertEquals("c", of1["B"])
+        val (o2, of2) = PlanGroups.step(o1, groups, of1, "C", -1)!!  // внутри блока — поменять местами
+        assertEquals(listOf("A", "C", "B"), o2)
+        assertEquals("c", of2["C"])
+        val (_, of3) = PlanGroups.step(o2, groups, of2, "C", -1)!!  // в конец «Требуется уточнение» (пустой)
+        assertEquals("b", of3["C"])
+        assertNull(PlanGroups.step(o2, groups, of2, "B", 1))  // последняя задача последнего блока
+    }
+
+    @Test fun planGroupsEditorRules() {
+        assertEquals("Нужен хотя бы один блок с названием", PlanGroups.validate(listOf(" ", "")))
+        assertEquals("Названия блоков не должны повторяться", PlanGroups.validate(listOf("Анализ", "анализ ")))
+        assertNull(PlanGroups.validate(listOf("Анализ", "", "Уточнить")))
+        val (g, of) = PlanGroups.normalize(listOf(PlanGroup("a", " Сегодня "), PlanGroup("n", "  ")), mapOf("X" to "c", "Y" to "a"))
+        assertEquals(listOf(PlanGroup("a", "Сегодня")), g)
+        assertEquals(mapOf("Y" to "a"), of)  // задачи удалённого блока — в первый
+    }
+
     @Test fun urgentAddEditDoneOrder() {
         var list = Urgent.add(emptyList(), "  Позвонить поставщику  ", "текст", 1000, "U-1")
         list = Urgent.add(list, "Отчёт", "", 2000, "U-2")

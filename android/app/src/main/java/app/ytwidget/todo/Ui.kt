@@ -127,6 +127,15 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.rounded.DragIndicator
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -243,6 +252,8 @@ fun TasksScreen(vm: MainViewModel, openSettings: () -> Unit) {
                     PullToRefreshBox(isRefreshing = vm.loading, onRefresh = vm::refresh, modifier = Modifier.weight(1f)) {
                         if (list.isEmpty()) {
                             EmptyState(vm)
+                        } else if (vm.tab == "day") {
+                            DayList(vm, list)
                         } else {
                             LazyColumn(contentPadding = PaddingValues(vertical = 6.dp), modifier = Modifier.fillMaxSize()) {
                                 items(list, key = { it.idReadable }) { issue -> IssueCard(vm, issue) }
@@ -266,6 +277,7 @@ fun TasksScreen(vm: MainViewModel, openSettings: () -> Unit) {
             confirmButton = { TextButton(onClick = { vm.deleteUrgent(u.id); deleting = null }) { Text("Удалить") } },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Отмена") } })
     }
+    if (vm.editingGroups) GroupsEditor(vm)
     if (confirmClearDone) {
         val n = vm.urgent.count { it.done }
         AlertDialog(onDismissRequest = { confirmClearDone = false },
@@ -539,6 +551,13 @@ private fun Filters(vm: MainViewModel, clearDoneUrgent: () -> Unit) {
             if (vm.hotOnly || vm.prioFilter.isNotEmpty() || vm.sprintFilter.isNotEmpty()) {
                 TextButton(onClick = vm::resetFilters) { Text("Сбросить") }
             }
+            if (vm.tab == "day") {
+                TextButton(onClick = { vm.editingGroups = true }) {
+                    Icon(Icons.Rounded.Tune, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Блоки")
+                }
+            }
             if (vm.tab == "day" && vm.plan.isNotEmpty()) {
                 TextButton(onClick = vm::clearPlan) { Text("Очистить план") }
             }
@@ -566,9 +585,178 @@ private fun MultiSelectChip(title: String, options: List<String>, selected: Set<
     }
 }
 
+// ---------------------------------------------------------------- вкладка «День»: блоки и перетаскивание
+/** Ключи элементов списка: задача — idReadable, заголовок блока — «g:id», пустой блок — «e:id». */
+@Composable
+private fun DayList(vm: MainViewModel, list: List<Issue>) {
+    val state = rememberLazyListState()
+    val heads = vm.planGroups.size > 1
+    val byGroup = list.groupBy { vm.groupOf(it.idReadable) }
+    var dragId by remember { mutableStateOf<String?>(null) }
+    var dragDy by remember { mutableFloatStateOf(0f) }
+    var target by remember { mutableStateOf<Pair<String, String?>?>(null) }  // блок и задача, перед которой вставим
+
+    fun findTarget(): Pair<String, String?>? {
+        val id = dragId ?: return null
+        val info = state.layoutInfo.visibleItemsInfo
+        val me = info.firstOrNull { it.key == id } ?: return null
+        val y = me.offset + dragDy + me.size / 2f
+        val hit = info.firstOrNull { y >= it.offset && y < it.offset + it.size }
+            ?: (if (y < (info.firstOrNull()?.offset ?: 0)) info.firstOrNull() else info.lastOrNull()) ?: return null
+        val key = hit.key as String
+        return when {
+            key.startsWith("g:") -> key.drop(2).let { gid -> gid to byGroup[gid]?.firstOrNull()?.idReadable }
+            key.startsWith("e:") -> key.drop(2) to null
+            else -> {
+                val gid = vm.groupOf(key)
+                if (y < hit.offset + hit.size / 2f) gid to key
+                else byGroup[gid].orEmpty().let { g -> gid to g.getOrNull(g.indexOfFirst { it.idReadable == key } + 1)?.idReadable }
+            }
+        }
+    }
+
+    fun handleFor(id: String): Modifier? = if (vm.filtersActive) null else Modifier.pointerInput(id, byGroup, vm.planGroups) {
+        detectDragGestures(
+            onDragStart = { dragId = id; dragDy = 0f; target = null },
+            onDrag = { change, amount ->
+                change.consume()
+                dragDy += amount.y
+                // у края экрана — прокрутить список, карточка остаётся под пальцем
+                val info = state.layoutInfo
+                info.visibleItemsInfo.firstOrNull { it.key == id }?.let { me ->
+                    val top = me.offset + dragDy
+                    val edge = 48f
+                    val d = when {
+                        top < info.viewportStartOffset + edge -> -24f
+                        top + me.size > info.viewportEndOffset - edge -> 24f
+                        else -> 0f
+                    }
+                    if (d != 0f) dragDy += state.dispatchRawDelta(d)
+                }
+                target = findTarget()
+            },
+            onDragEnd = {
+                val t = findTarget()
+                dragId = null; dragDy = 0f; target = null
+                if (t != null) vm.drop(id, t.first, t.second)
+            },
+            onDragCancel = { dragId = null; dragDy = 0f; target = null },
+        )
+    }
+
+    @Composable
+    fun Marker() = Box(Modifier.fillMaxWidth().padding(vertical = 2.dp).height(3.dp)
+        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)))
+
+    LazyColumn(state = state, contentPadding = PaddingValues(vertical = 6.dp), modifier = Modifier.fillMaxSize()) {
+        vm.planGroups.forEachIndexed { gi, g ->
+            val cards = byGroup[g.id].orEmpty()
+            if (heads) {
+                item(key = "g:${g.id}") {
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(top = if (gi == 0) 4.dp else 14.dp, bottom = 4.dp)) {
+                        Text(g.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                        if (cards.isNotEmpty()) Text("  ${cards.size}", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        HorizontalDivider(Modifier.weight(1f).padding(start = 10.dp))
+                    }
+                }
+                if (cards.isEmpty()) {
+                    item(key = "e:${g.id}") {
+                        val hot = dragId != null && target?.first == g.id
+                        Box(Modifier.fillMaxWidth().padding(vertical = 4.dp).height(52.dp)
+                            .border(if (hot) 2.dp else 1.dp,
+                                if (hot) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                                RoundedCornerShape(6.dp)),
+                            contentAlignment = Alignment.Center) {
+                            Text(if (vm.filtersActive) "Нет задач" else "Перетащите задачу сюда",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+            cards.forEachIndexed { n, issue ->
+                item(key = issue.idReadable) {
+                    val dragging = dragId == issue.idReadable
+                    val t = target
+                    Column(Modifier.zIndex(if (dragging) 1f else 0f).graphicsLayer {
+                        if (dragging) { translationY = dragDy; shadowElevation = 16f; alpha = 0.92f }
+                    }) {
+                        if (!dragging && dragId != null && t != null && t.first == g.id && t.second == issue.idReadable) Marker()
+                        IssueCard(vm, issue, handleFor(issue.idReadable))
+                        if (!dragging && dragId != null && t != null && t.first == g.id && t.second == null && n == cards.lastIndex) Marker()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Окно настройки блоков плана на день: названия, порядок, добавление и удаление. */
+@Composable
+private fun GroupsEditor(vm: MainViewModel) {
+    val rows = remember { mutableStateListOf<PlanGroup>().apply { addAll(vm.planGroups) } }
+    var error by remember { mutableStateOf<String?>(null) }
+    var removing by remember { mutableStateOf<Int?>(null) }
+    val counts = vm.plan.groupingBy { vm.groupOf(it) }.eachCount()
+    fun swap(k: Int, d: Int) { val a = rows[k]; rows[k] = rows[k + d]; rows[k + d] = a }
+    AlertDialog(
+        onDismissRequest = { vm.editingGroups = false },
+        title = { Text("Блоки вкладки «День»") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("Например: «Требуется уточнение», «Анализ», «В работе». Задачи перетаскиваются между блоками за ручку " +
+                    "или через меню карточки ⋮. Задачи удалённого блока перейдут в первый.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                rows.forEachIndexed { k, g ->
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 8.dp)) {
+                        OutlinedTextField(
+                            value = g.name, singleLine = true, modifier = Modifier.weight(1f),
+                            onValueChange = { rows[k] = g.copy(name = it.replace("\n", " ").take(PlanGroups.NAME_MAX)); error = null },
+                            supportingText = { Text("задач: ${counts[g.id] ?: 0}") },
+                        )
+                        Column {
+                            IconButton(onClick = { swap(k, -1) }, enabled = k > 0, modifier = Modifier.size(36.dp)) {
+                                Icon(Icons.Rounded.KeyboardArrowUp, "Выше")
+                            }
+                            IconButton(onClick = { swap(k, 1) }, enabled = k < rows.lastIndex, modifier = Modifier.size(36.dp)) {
+                                Icon(Icons.Rounded.KeyboardArrowDown, "Ниже")
+                            }
+                        }
+                        IconButton(onClick = { if ((counts[g.id] ?: 0) > 0) removing = k else rows.removeAt(k) },
+                            enabled = rows.size > 1) { Icon(Icons.Rounded.DeleteOutline, "Удалить блок") }
+                    }
+                }
+                TextButton(onClick = { rows.add(PlanGroup("g-" + java.util.UUID.randomUUID().toString().take(8), "")) }) {
+                    Icon(Icons.Rounded.Add, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Добавить блок")
+                }
+                error?.let { Text(it, color = Attn, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                error = PlanGroups.validate(rows.map { it.name })
+                if (error == null) { vm.setGroups(rows.toList()); vm.editingGroups = false }
+            }) { Text("Сохранить") }
+        },
+        dismissButton = { TextButton(onClick = { vm.editingGroups = false }) { Text("Отмена") } },
+    )
+    removing?.let { k ->
+        val g = rows.getOrNull(k)
+        if (g == null) { removing = null; return@let }
+        AlertDialog(onDismissRequest = { removing = null },
+            title = { Text("Удалить блок «${g.name}»?") },
+            text = { Text("Его задачи (${counts[g.id] ?: 0}) перейдут в первый блок.") },
+            confirmButton = { TextButton(onClick = { rows.removeAt(k); removing = null }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { removing = null }) { Text("Отмена") } })
+    }
+}
+
 // ---------------------------------------------------------------- карточка задачи
 @Composable
-private fun IssueCard(vm: MainViewModel, issue: Issue) {
+private fun IssueCard(vm: MainViewModel, issue: Issue, handle: Modifier? = null) {
     val ctx = LocalContext.current
     val dayTab = vm.tab == "day"
     val done = dayTab && issue.idReadable in vm.done
@@ -586,8 +774,13 @@ private fun IssueCard(vm: MainViewModel, issue: Issue) {
                         Icon(if (done) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
                             if (done) "Не сделано" else "Сделано", tint = if (done) Color(0xFF43A047) else MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    IconButton(onClick = { vm.move(issue, -1) }, enabled = !vm.filtersActive) { Icon(Icons.Rounded.KeyboardArrowUp, "Выше") }
-                    IconButton(onClick = { vm.move(issue, 1) }, enabled = !vm.filtersActive) { Icon(Icons.Rounded.KeyboardArrowDown, "Ниже") }
+                    IconButton(onClick = { vm.move(issue, -1) }, enabled = !vm.filtersActive && vm.canMove(issue, -1)) { Icon(Icons.Rounded.KeyboardArrowUp, "Выше") }
+                    IconButton(onClick = { vm.move(issue, 1) }, enabled = !vm.filtersActive && vm.canMove(issue, 1)) { Icon(Icons.Rounded.KeyboardArrowDown, "Ниже") }
+                    if (handle != null) {  // ручка для перетаскивания между блоками
+                        Box(handle.size(48.dp), contentAlignment = Alignment.Center) {
+                            Icon(Icons.Rounded.DragIndicator, "Перетащить", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                 }
             }
             Column(Modifier.weight(1f).padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 4.dp)) {
@@ -884,6 +1077,16 @@ private fun StatusMenu(vm: MainViewModel, issue: Issue) {
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             DropdownMenuItem(text = { Text("Написать комментарий…") }, leadingIcon = { Icon(Icons.Rounded.AddComment, null) },
                 onClick = { open = false; vm.commentFor = issue.idReadable })
+            HorizontalDivider()
+            MenuNote("Блок плана на день", bold = true)
+            val cur = if (issue.idReadable in vm.plan) vm.groupOf(issue.idReadable) else null
+            vm.planGroups.forEach { g ->
+                DropdownMenuItem(text = { Text(g.name) },
+                    leadingIcon = { Icon(if (g.id == cur) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked, null) },
+                    onClick = { open = false; vm.moveToGroup(issue, g.id) })
+            }
+            DropdownMenuItem(text = { Text("Настроить блоки…") }, leadingIcon = { Icon(Icons.Rounded.Tune, null) },
+                onClick = { open = false; vm.editingGroups = true })
             HorizontalDivider()
             MenuNote("Сменить статус", bold = true)
             val opts = options

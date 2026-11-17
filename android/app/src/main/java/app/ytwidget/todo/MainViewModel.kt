@@ -33,6 +33,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var sprintFilter by mutableStateOf(store.sprintFilter); private set
     var plan by mutableStateOf(store.plan); private set
     var done by mutableStateOf(store.done); private set
+    var planGroups by mutableStateOf(store.planGroups); private set
+    var planGroupOf by mutableStateOf(store.planGroupOf); private set
+    /** Открыто окно настройки блоков плана на день. */
+    var editingGroups by mutableStateOf(false)
 
     var urgent by mutableStateOf(store.urgent); private set
     var mentions by mutableStateOf(store.mentions()); private set
@@ -116,7 +120,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun visible(): List<Issue> {
         val base = when (tab) {
-            "day" -> Model.planOrder(allIssues(), plan, done)
+            "day" -> Model.planOrder(allIssues(), plan, done, planGroups, planGroupOf)
             "attention" -> mentions.sortedWith(compareBy<Issue> { !attnWaiting(it) }.thenByDescending { mention(it)?.time ?: 0L })
             else -> issues
         }
@@ -214,7 +218,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleStar(issue: Issue) {
         val id = issue.idReadable
         plan = if (id in plan) plan - id else plan + id
-        if (id !in plan) done = done - id
+        if (id !in plan) { done = done - id; planGroupOf = planGroupOf - id; store.planGroupOf = planGroupOf }
         store.plan = plan; store.done = done
         refreshWidget()
     }
@@ -225,21 +229,51 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         refreshWidget()
     }
 
-    /** Сдвинуть задачу в плане на delta позиций среди видимых (вверх −1, вниз +1). */
-    fun move(issue: Issue, delta: Int) {
-        val order = Model.planOrder(allIssues(), plan, done).map { it.idReadable }.toMutableList()
-        val i = order.indexOf(issue.idReadable)
-        val j = i + delta
-        if (i < 0 || j !in order.indices) return
-        order.add(j, order.removeAt(i))
+    private fun dayOrder() = Model.planOrder(allIssues(), plan, done, planGroups, planGroupOf).map { it.idReadable }
+
+    private fun applyOrder(order: List<String>, of: Map<String, String>) {
         plan = order + plan.filter { it !in order }  // задачи плана, которых сейчас нет в списке, — в конце
-        store.plan = plan
+        planGroupOf = of.filterKeys { it in plan }
+        store.plan = plan; store.planGroupOf = planGroupOf
+        refreshWidget()
+    }
+
+    fun groupOf(id: String) = PlanGroups.groupOf(id, planGroups, planGroupOf)
+
+    /** Сдвинуть задачу в плане (вверх −1, вниз +1); на границе блока — в соседний блок. */
+    fun move(issue: Issue, delta: Int) {
+        PlanGroups.step(dayOrder(), planGroups, planGroupOf, issue.idReadable, delta)?.let { applyOrder(it.first, it.second) }
+    }
+
+    fun canMove(issue: Issue, delta: Int) = PlanGroups.step(dayOrder(), planGroups, planGroupOf, issue.idReadable, delta) != null
+
+    /** Перетаскивание на вкладке «День»: в блок [gid] перед задачей [before] (null — в конец блока). */
+    fun drop(id: String, gid: String, before: String?) {
+        val (order, of) = PlanGroups.drop(dayOrder(), planGroups, planGroupOf, id, gid, before)
+        applyOrder(order, of)
+    }
+
+    /** «Переместить в блок»: задачи нет в плане — добавится. */
+    fun moveToGroup(issue: Issue, gid: String) {
+        if (planGroups.none { it.id == gid }) return
+        val id = issue.idReadable
+        if (id !in plan) plan = plan + id
+        planGroupOf = planGroupOf + (id to gid)
+        store.plan = plan; store.planGroupOf = planGroupOf
+        refreshWidget()
+    }
+
+    /** Новый список блоков из редактора. Задачи удалённых блоков переходят в первый блок. */
+    fun setGroups(groups: List<PlanGroup>) {
+        val (g, of) = PlanGroups.normalize(groups, planGroupOf)
+        planGroups = g; planGroupOf = of
+        store.planGroups = g; store.planGroupOf = of
         refreshWidget()
     }
 
     fun clearPlan() {
-        plan = emptyList(); done = emptySet()
-        store.plan = plan; store.done = done
+        plan = emptyList(); done = emptySet(); planGroupOf = emptyMap()
+        store.plan = plan; store.done = done; store.planGroupOf = planGroupOf
         refreshWidget()
     }
 

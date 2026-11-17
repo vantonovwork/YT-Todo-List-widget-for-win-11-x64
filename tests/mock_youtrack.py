@@ -89,9 +89,17 @@ def initial_mentions():
     ]
 
 
+def initial_watched():
+    """Задачи под наблюдением (запрос «tag: Star …»): чужая задача WI-1."""
+    return [{"id": "5-1", "idReadable": "WI-1", "summary": "Чужая задача под наблюдением",
+             "customFields": [st("Анализ"), pr("Средний"), due(None), sp()], "comments": [cm(900)]}]
+
+
 class State:
     issues = initial()
     mentions = initial_mentions()
+    watched = initial_watched()
+    activities = {}  # id задачи -> история изменений полей (для «кто сменил статус»)
     mode = "ok"
     commands = []
     requests = []
@@ -148,6 +156,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"login": "me"})
         if p == "/api/issues":
             q = parse_qs(urlparse(self.path).query).get("query", [""])[0]
+            if "tag: Star" in q:
+                return self._send(State.watched)
             if "mentions" in q:
                 if State.mode == "mentions500":
                     return self._send({"error_description": "mentions down"}, 500)
@@ -169,9 +179,13 @@ class Handler(BaseHTTPRequestHandler):
                                                       for e, n in EVENTS.get(cur, [])]})
             return self._send({"possibleEvents": [], "projectCustomField": {"bundle": {"values": [
                 {"name": v, "archived": "archived" in v} for v in ENUM_STATES]}}})
+        if p.startswith("/api/issues/") and p.endswith("/activities"):
+            return self._send(State.activities.get(parts[3], []))
         if p.startswith("/api/issues/") and len(parts) == 4:
+            issue = next((i for i in State.issues + State.mentions + State.watched if i["id"] == parts[3]), {})
             return self._send({"description": "Нужно **обновить** выгрузку.\n\nШаги:\n1. Проверить "
-                                              "[документацию](http://x)\n```\nкод\n```\nГотово."})
+                                              "[документацию](http://x)\n```\nкод\n```\nГотово.",
+                               "comments": issue.get("comments", [])})
         self._send({}, 404)
 
     def do_POST(self):
@@ -182,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/test/reset":
             State.issues, State.mode, State.commands, State.requests = initial(), "ok", [], []
             State.mentions = initial_mentions()
+            State.watched, State.activities = initial_watched(), {}
         elif p == "/test/mode":
             State.mode = parse_qs(u.query).get("m", ["ok"])[0]
         elif p == "/test/bulk":
@@ -193,6 +208,15 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/test/many-comments":
             for i in State.issues[:5]:
                 i["comments"].append(cm(now))
+        elif p in ("/test/watch-status", "/test/watch-status-mine"):  # кто-то (или вы) сменил статус WI-1
+            who = ("me", "Я") if p.endswith("mine") else ("pavel", "Павел Драничников")
+            f = State.watched[0]["customFields"][0]
+            f["value"] = {"name": "В разработке" if f["value"]["name"] != "В разработке" else "Тест"}
+            State.activities.setdefault("5-1", []).insert(0, {
+                "timestamp": now, "author": {"login": who[0], "fullName": who[1]},
+                "field": {"name": "Статус задачи"}, "added": [{"name": f["value"]["name"]}]})
+        elif p == "/test/watch-comment":  # новый комментарий коллеги в WI-1
+            State.watched[0]["comments"].append(cm(now, who="alina", name="Алина Малышева", text="Обновила оценку"))
         elif p == "/test/mention":  # новое упоминание в чужой задаче OE-50
             State.mentions[0]["comments"].append(cm(now, who="pavel", name="Павел Драничников",
                                                     text="@me ещё вопрос по задаче"))

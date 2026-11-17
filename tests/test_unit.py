@@ -142,6 +142,102 @@ class TestMentions(unittest.TestCase):
         self.assertEqual(w.load_attn(), {})
 
 
+class TestAndroidParity(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv, cls.base = mock.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        mock.control(self.base, "/test/reset")
+
+    def test_status_author(self):
+        mock.control(self.base, "/test/watch-status")
+        issue = w.fetch_issues(self.base, mock.TOKEN, "tag: Star", 10)[0]
+        a = w.fetch_status_author(self.base, mock.TOKEN, issue, "Статус задачи", "В разработке")
+        self.assertEqual(a["fullName"], "Павел Драничников")
+        self.assertIsNone(w.fetch_status_author(self.base, mock.TOKEN, issue, "Статус задачи", "Готова"))
+
+    def test_fetch_full(self):
+        issue = w.fetch_issues(self.base, mock.TOKEN, "q", 10)[0]
+        data = w.fetch_full(self.base, mock.TOKEN, issue)
+        self.assertIn("обновить", data["description"])
+        self.assertEqual(len(data["comments"]), 1)
+
+    def test_markdown_renderer(self):
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        t = tk.Text(root)
+        opened = []
+        md = w.MarkdownRenderer(t, "https://yt.example", open_url=opened.append)
+        md.render("# Заголовок\n**жирный** и *курсив*, `код`, ~~старое~~\n> цитата\n- [x] сделано\n- пункт\n"
+                  "| A | Bb |\n|---|---|\n| 1 | 2 |\n---\n```\nprint(1)\n```\n[ссылка](/issue/X-1) "
+                  "![схема](схема.png) @Ivan.P https://site.example/a")
+        text = t.get("1.0", "end-1c")
+        for frag in ("Заголовок", "жирный и курсив, код, старое", "цитата", "☑ сделано", "• пункт", "A │ Bb",
+                     "1 │ 2 ", "print(1)", "ссылка", "🖼 схема", "@Ivan.P"):
+            self.assertIn(frag, text)
+        self.assertNotIn("**", text)
+        for tag in ("h1", "b", "i", "code", "s", "quote", "table", "pre", "link", "img", "mention", "hr"):
+            self.assertTrue(t.tag_ranges(tag), tag)
+        link = next(n for n in t.tag_names() if n.startswith("link-"))
+        self.assertTrue(t.tk.call(t._w, "tag", "bind", link, "<Button-1>"), "у ссылки есть обработчик клика")
+        md.open_url(md._url("/issue/X-1"))
+        self.assertEqual(opened, ["https://yt.example/issue/X-1"])
+
+    def test_ssl_message(self):
+        import ssl
+        import urllib.error
+        orig = w.urllib.request.urlopen
+
+        def boom(*a, **k):
+            raise urllib.error.URLError(ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED"))
+        w.urllib.request.urlopen = boom
+        try:
+            with self.assertRaises(w.YTError) as ctx:
+                w.fetch_issues("https://yt.example", "t", "q", 1)
+        finally:
+            w.urllib.request.urlopen = orig
+        self.assertIn("сертификата", str(ctx.exception))
+
+    def test_version_single_source(self):
+        import importlib.util
+        import version
+        self.assertEqual(w.VERSION, version.VERSION)
+        spec = importlib.util.spec_from_file_location("inst", os.path.join(os.path.dirname(w.__file__), "installer.py"))
+        inst = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inst)
+        self.assertEqual(inst.VERSION, version.VERSION)
+
+
+class TestPlanGroups(unittest.TestCase):
+    def setUp(self):
+        os.makedirs(w.CFG_DIR, exist_ok=True)
+
+    def test_defaults_and_legacy(self):
+        with open(w.PLAN_PATH, "w", encoding="utf-8") as f:
+            json.dump(["A", "B"], f)
+        groups, of = w.load_plan_groups()
+        self.assertEqual(groups, w.DEFAULT_GROUPS)
+        self.assertEqual(of, {})
+
+    def test_save_keeps_groups_and_drops_unknown(self):
+        groups = [{"id": "g1", "name": "Анализ"}, {"id": "g2", "name": "Уточнить"}]
+        w.save_plan(["A", "B", "C"], set(), groups, {"A": "g2", "B": "nope", "Z": "g1"})
+        g, of = w.load_plan_groups()
+        self.assertEqual(g, groups)
+        self.assertEqual(of, {"A": "g2"}, "неизвестный блок и задачи вне плана отброшены")
+        w.save_plan(["A", "B"], {"A"})  # старый вызов без блоков — блоки не теряются
+        self.assertEqual(w.load_plan_groups(), (groups, {"A": "g2"}))
+        self.assertEqual(w.load_plan(), (["A", "B"], {"A"}))
+
+
 class TestHotkey(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(w.parse_hotkey("Win+Shift+Y"), (0x8 | 0x4, ord("Y")))
