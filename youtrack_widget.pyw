@@ -1020,10 +1020,78 @@ def acquire_single_instance(q: queue.Queue) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- буфер обмена в полях ввода
+# Tk 8.6 на Windows узнаёт Ctrl+V/C/X по латинской букве. В русской раскладке клавиша V даёт «м»
+# (keysym Cyrillic_em), и вставка/копирование по горячим клавишам не срабатывают. Поэтому сочетания
+# определяем по физической клавише (keycode — виртуальный код Windows, от раскладки не зависит).
+EDIT_KEYS = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 90: "<<Undo>>", 89: "<<Redo>>", 65: "select_all"}
+
+
+def _select_all(w):
+    if isinstance(w, tk.Text):
+        w.tag_add("sel", "1.0", "end-1c")
+        w.mark_set("insert", "end-1c")
+    else:
+        w.select_range(0, "end")
+        w.icursor("end")
+
+
+def _edit_hotkey(e):
+    """Ctrl+V/C/X/A/Z/Y в полях ввода — в любой раскладке клавиатуры."""
+    action = EDIT_KEYS.get(e.keycode)
+    if not action or not (e.state & 0x4) or (e.state & 0x20000):  # нужен Ctrl и не нужен Alt (AltGr)
+        return None
+    w = e.widget
+    if action == "select_all":
+        _select_all(w)
+    elif action in ("<<Undo>>", "<<Redo>>") and not isinstance(w, tk.Text):
+        return None
+    else:
+        w.event_generate(action)
+    return "break"
+
+
+def _edit_menu(e):
+    """Меню по правому клику в поле ввода: Вырезать / Копировать / Вставить / Выделить всё."""
+    w = e.widget
+    try:
+        w.focus_set()
+    except tk.TclError:
+        pass
+    is_text = isinstance(w, tk.Text)
+    has_sel = bool(w.tag_ranges("sel")) if is_text else w.selection_present()
+    try:
+        has_clip = bool(w.clipboard_get())
+    except tk.TclError:
+        has_clip = False
+    editable = str(w.cget("state")) == "normal"
+    m = tk.Menu(w, tearoff=0, bg=DLG_CARD, fg=DLG_TEXT, activebackground=DLG_HOVER, activeforeground=DLG_TEXT,
+                disabledforeground="#6a6a6a", bd=0)
+    m.add_command(label="Вырезать", accelerator="Ctrl+X", state="normal" if has_sel and editable else "disabled",
+                  command=lambda: w.event_generate("<<Cut>>"))
+    m.add_command(label="Копировать", accelerator="Ctrl+C", state="normal" if has_sel else "disabled",
+                  command=lambda: w.event_generate("<<Copy>>"))
+    m.add_command(label="Вставить", accelerator="Ctrl+V", state="normal" if has_clip and editable else "disabled",
+                  command=lambda: w.event_generate("<<Paste>>"))
+    m.add_separator()
+    m.add_command(label="Выделить всё", accelerator="Ctrl+A", command=lambda: _select_all(w))
+    w._edit_menu = m  # для автотестов
+    m.tk_popup(e.x_root, e.y_root)
+    return "break"
+
+
+def install_edit_bindings(root):
+    """Для всех полей ввода приложения (Entry и Text): горячие клавиши в любой раскладке + меню по правому клику."""
+    for cls in ("Entry", "Text"):
+        root.bind_class(cls, "<Control-KeyPress>", _edit_hotkey, add="+")
+        root.bind_class(cls, "<Button-3>", _edit_menu)
+
+
 # ---------------------------------------------------------------- UI
 class Widget(tk.Tk):
     def __init__(self, q: queue.Queue):
         super().__init__()
+        install_edit_bindings(self)  # вставка из буфера и меню правой кнопки во всех полях ввода
         self.q = q
         self.cfg = load_cfg()
         self.issues = []
@@ -2613,11 +2681,16 @@ class Widget(tk.Tk):
         e_title.grid(row=1, column=0, sticky="we", ipady=5, ipadx=6)
 
         def on_title(*_):
+            # всё за один проход: Tk не вызывает этот обработчик повторно на v_title.set() внутри него
             s = v_title.get()
-            if len(s) > URGENT_TITLE_MAX:
-                v_title.set(s[:URGENT_TITLE_MAX])
+            fixed = " ".join(s.split()) if ("\n" in s or "\r" in s or "\t" in s) else s  # вставка — в одну строку
+            if len(fixed) > URGENT_TITLE_MAX:
+                fixed = fixed[:URGENT_TITLE_MAX]
                 self.bell()
-                return
+            if fixed != s:
+                v_title.set(fixed)
+                e_title.icursor("end")
+                s = fixed
             title_cnt.set(f"{len(s)}/{URGENT_TITLE_MAX}")
             c1.configure(fg="#ef6c00" if len(s) >= URGENT_TITLE_MAX - 10 else SUB_)
             err.configure(text="")
@@ -2643,7 +2716,7 @@ class Widget(tk.Tk):
         t_text.bind("<<Modified>>", on_text)
         err = tk.Label(win, text="", bg=BG_, fg=ERR, font=(FONT, 9), anchor="w")
         err.grid(row=4, column=0, sticky="we", pady=(6, 0))
-        tk.Label(win, text="Ctrl+Enter — сохранить, Esc — отмена. Задача хранится только в виджете, "
+        tk.Label(win, text="Ctrl+V или правый клик — вставить из буфера. Ctrl+Enter — сохранить, Esc — отмена. Задача хранится только в виджете, "
                            "в YouTrack не попадает.", bg=BG_, fg=SUB_, font=(FONT, 8), justify="left",
                  wraplength=380).grid(row=5, column=0, sticky="w")
 
@@ -2717,7 +2790,7 @@ class Widget(tk.Tk):
             t_text.insert("1.0", drafts[iid])
         err = tk.Label(win, text="", bg=BG_, fg=ERR, font=(FONT, 9), anchor="w", justify="left", wraplength=400)
         err.grid(row=3, column=0, sticky="we", pady=(6, 0))
-        tk.Label(win, text="Ctrl+Enter — отправить, Esc — закрыть (текст сохранится как черновик). "
+        tk.Label(win, text="Ctrl+V или правый клик — вставить из буфера. Ctrl+Enter — отправить, Esc — закрыть (текст сохранится как черновик). "
                            "Поддерживается разметка YouTrack, @логин — упомянуть коллегу.",
                  bg=BG_, fg=SUB_, font=(FONT, 8), justify="left", wraplength=400).grid(row=4, column=0, sticky="w")
 

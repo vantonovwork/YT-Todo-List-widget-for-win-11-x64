@@ -802,6 +802,114 @@ class TestAttention(Base):
             self.assertLessEqual(row.winfo_reqwidth(), row.winfo_width() + 1, f"вкладки помещаются при {wd}")
 
 
+class KeyEv:
+    """Нажатие так, как его присылает Windows в русской раскладке: keysym кириллический, keycode — клавиши V/C/…"""
+    def __init__(self, widget, keycode, keysym, state=0x4):
+        self.widget, self.keycode, self.keysym, self.state = widget, keycode, keysym, state
+        self.x_root = self.y_root = 0
+
+
+class TestClipboard(Base):
+    """Вставка из буфера обмена в окнах комментария и срочной задачи (Ctrl+V в любой раскладке, правый клик)."""
+
+    def setUp(self):
+        super().setUp()
+        self._popup = w.tk.Menu.tk_popup
+        w.tk.Menu.tk_popup = lambda *a, **k: None  # меню модальное — проверяем его пункты, не показывая
+        self.addCleanup(setattr, w.tk.Menu, "tk_popup", self._popup)
+
+    def set_clipboard(self, app, text):
+        if not hasattr(self, "_saved_clip"):  # вернуть пользователю его буфер после теста
+            try:
+                self._saved_clip = app.clipboard_get()
+            except w.tk.TclError:
+                self._saved_clip = None
+            self.addCleanup(self.restore_clipboard, app)
+        app.clipboard_clear()
+        app.clipboard_append(text)
+        app.update()
+
+    def restore_clipboard(self, app):
+        try:
+            if self._saved_clip is not None:
+                app.clipboard_clear()
+                app.clipboard_append(self._saved_clip)
+                app.update()
+        except w.tk.TclError:
+            pass
+
+    def entry_of(self, win):
+        return next(ch for ch in win.winfo_children() if isinstance(ch, w.tk.Entry))
+
+    def test_comment_ctrl_v_russian_layout_and_menu(self):
+        app = self.make_app()
+        app.open_comment_editor(self.card(app, "OE-1")["issue"])
+        pump(app, 0.2)
+        text = next(ch for ch in app._comment_win.winfo_children() if isinstance(ch, w.tk.Text))
+        self.set_clipboard(app, "Проверил логи.\nВсё ок, @alina посмотри")
+        text.focus_set()
+        self.assertEqual(w._edit_hotkey(KeyEv(text, 86, "Cyrillic_em")), "break")  # Ctrl+V в русской раскладке
+        pump(app, 0.05)
+        self.assertEqual(text.get("1.0", "end-1c"), "Проверил логи.\nВсё ок, @alina посмотри")
+        # правый клик → «Вставить» (вставка в позицию курсора)
+        text.mark_set("insert", "1.0")
+        w._edit_menu(KeyEv(text, 0, ""))
+        m = text._edit_menu
+        labels = [m.entrycget(i, "label") for i in range(m.index("end") + 1) if m.type(i) != "separator"]
+        self.assertEqual(labels, ["Вырезать", "Копировать", "Вставить", "Выделить всё"])
+        m.invoke(labels.index("Вставить"))
+        self.assertTrue(text.get("1.0", "end-1c").startswith("Проверил логи.\nВсё ок, @alina посмотриПроверил"))
+        # Ctrl+A (ф) и Ctrl+C (с) тоже по физической клавише
+        w._edit_hotkey(KeyEv(text, 65, "Cyrillic_ef"))
+        self.assertTrue(text.tag_ranges("sel"))
+        w._edit_hotkey(KeyEv(text, 67, "Cyrillic_es"))
+        self.assertEqual(app.clipboard_get(), text.get("1.0", "end-1c"))
+        # Ctrl+Enter не перехватывается — отправка комментария работает как раньше
+        self.assertIsNone(w._edit_hotkey(KeyEv(text, 13, "Return")))
+        # без Ctrl (просто клавиша «м») — обычный ввод, не вставка
+        self.assertIsNone(w._edit_hotkey(KeyEv(text, 86, "Cyrillic_em", state=0)))
+        app._comment_win._close() if hasattr(app._comment_win, "_close") else app._comment_win.destroy()
+
+    def test_urgent_paste_limits(self):
+        app = self.make_app()
+        app.open_urgent_editor()
+        win = app._urgent_win
+        pump(app, 0.2)
+        entry = self.entry_of(win)
+        # многострочный и длинный текст в название: в одну строку и не длиннее 100 символов
+        self.set_clipboard(app, "Написать Ивану\nуточнить сроки " + "х" * 200)
+        entry.focus_set()
+        w._edit_hotkey(KeyEv(entry, 86, "Cyrillic_em"))
+        pump(app, 0.05)
+        title = win._title_var.get()
+        self.assertNotIn("\n", title)
+        self.assertTrue(title.startswith("Написать Ивану уточнить сроки"))
+        self.assertEqual(len(title), 100)
+        # текст: многострочный сохраняется, длина — не больше 1000
+        self.set_clipboard(app, "строка 1\nстрока 2\n" + "т" * 1500)
+        win._text.focus_set()
+        w._edit_hotkey(KeyEv(win._text, 86, "Cyrillic_em"))
+        pump(app, 0.05)
+        body = win._text.get("1.0", "end-1c")
+        self.assertTrue(body.startswith("строка 1\nстрока 2\n"))
+        self.assertEqual(len(body), 1000)
+        # правый клик в названии → «Вставить» доступна; при пустом поле «Копировать» недоступна
+        entry.delete(0, "end")
+        w._edit_menu(KeyEv(entry, 0, ""))
+        m = entry._edit_menu
+        states = {m.entrycget(i, "label"): m.entrycget(i, "state") for i in range(m.index("end") + 1)
+                  if m.type(i) != "separator"}
+        self.assertEqual((states["Вставить"], states["Копировать"]), ("normal", "disabled"))
+        labels = [m.entrycget(i, "label") if m.type(i) != "separator" else "" for i in range(m.index("end") + 1)]
+        m.invoke(labels.index("Вставить"))  # вставка через меню: тоже одна строка и не длиннее 100
+        pump(app, 0.05)
+        self.assertTrue(win._title_var.get().startswith("строка 1 строка 2 т"))
+        self.assertEqual(len(win._title_var.get()), 100)
+        win._save()
+        pump(app, 0.1)
+        self.assertEqual(len(app.urgent), 1, "задача со вставленным текстом сохраняется")
+
+
 class TestCollapse(Base):
     def test_header_collapse_and_expand(self):
         app = self.make_app()
