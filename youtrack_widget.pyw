@@ -3352,8 +3352,9 @@ class Widget(tk.Tk):
         self._drag = None
 
     def _can_drag(self):
-        return (self.cfg.get("tab", "all") == "day" and not self._search_text()
-                and not self._prio_filter() and not self.cfg.get("due_hot") and not self.cfg.get("sprint_filter"))
+        """Порядок и блоки плана можно менять, если поиск и фильтры не скрывают ни одной задачи плана.
+        Фильтр, который ничего не прячет (например, отмечены все приоритеты), перетаскиванию не мешает."""
+        return self.cfg.get("tab", "all") == "day" and len(self.visible) == len(self.cards)
 
     def _on_drag(self, e):
         press = getattr(self, "_press", None)
@@ -3366,7 +3367,7 @@ class Widget(tk.Tk):
                 return
             if not self._can_drag():
                 if self.cfg.get("tab", "all") == "day":
-                    self.status_lbl.configure(text="Сбросьте поиск и фильтры, чтобы менять порядок", fg=BG_SUB)
+                    self.status_lbl.configure(text="Часть задач плана скрыта поиском или фильтром — сбросьте их, чтобы перетаскивать", fg=BG_SUB)
                 return
             self._drag = {"card": press[0], "last_y": press[3], "line": None}
             c.tag_raise(f"c{press[0]}")

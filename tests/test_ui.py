@@ -206,9 +206,9 @@ class TestPlan(Base):
         self.assertEqual(self.ids(app), ["OE-3", "OE-2", "OE-1"])
         self.assertEqual(w.load_plan()[0][:3], ["OE-3", "OE-2", "OE-1"])
         self.assertEqual(cv.canvasy(0), 0, "короткий список не сдвигается")
-        # при включённом поиске перетаскивать нельзя
+        # поиск скрывает часть задач плана — перетаскивать нельзя
         app.search.event_generate("<FocusIn>")
-        app.search_var.set("срок")
+        app.search_var.set("завтра")
         app._apply_filter_now()
         before = list(app.plan)
         x1, y1, x2, y2 = cv.bbox("h0")
@@ -216,7 +216,7 @@ class TestPlan(Base):
         app._on_drag(Ev((x1 + x2) / 2, y2 + 80))
         app._on_release(Ev((x1 + x2) / 2, y2 + 80))
         self.assertEqual(app.plan, before)
-        self.assertIn("Сбросьте поиск", app.status_lbl.cget("text"))
+        self.assertIn("скрыта поиском или фильтром", app.status_lbl.cget("text"))
         app.search_var.set("")
         app._apply_filter_now()
         # новый день — галочки сбрасываются
@@ -1229,6 +1229,27 @@ class TestDayGroups(Base):
         app.render()
         app._card_menu(KeyEv(app, 0, ""), self.card(app, "OE-1")["issue"])
         self.assertEqual(app.menu.entrycget(app.menu_up_index, "state"), "disabled")
+
+    def test_filter_hiding_nothing_allows_drag(self):
+        """Отмечены все приоритеты (фильтр ничего не прячет) — перетаскивание работает; прячет — нет."""
+        w.save_plan(["OE-1", "OE-2", "OE-3"], set())
+        app = self.make_app(tab="day")
+        self.make_groups(app, ["На сегодня", "Анализ", "Уточнить", "Ждёт ответа"])
+        app.cfg["prio_filter"] = sorted({c["prio"] or app.NO_PRIO for c in app.cards})
+        app._apply_filter()
+        self.assertEqual(len(app.visible), 3)
+        self.assertTrue(app._can_drag())
+        self.assertIn("Перетащите задачу сюда", self.texts(app))
+        g = {x["name"]: x["id"] for x in app.plan_groups}
+        cv = app.canvas
+        target = cv.bbox([i for i in cv.find_withtag("gempty") if cv.type(i) == "rectangle"][-1])
+        self.drag(app, self.ids(app).index("OE-2"), (target[1] + target[3]) / 2)
+        self.assertEqual(app.group_of("OE-2"), g["Ждёт ответа"])
+        # фильтр прячет задачу плана — нельзя
+        app.cfg["prio_filter"] = [app.visible[0]["prio"]]
+        app._apply_filter()
+        self.assertLess(len(app.visible), 3)
+        self.assertFalse(app._can_drag())
 
     def test_add_from_all_tab_and_delete_group(self):
         app = self.make_app()
