@@ -106,6 +106,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     val filtersActive get() = search.isNotBlank() || hotOnly || prioFilter.isNotEmpty() || sprintFilter.isNotEmpty()
 
+    /** Порядок и блоки плана можно менять, если поиск и фильтры не скрывают ни одной задачи плана
+     *  (фильтр, который ничего не прячет — например, отмечены все приоритеты, — не мешает). */
+    fun canReorder() = tab == "day" && visible().size == dayCount()
+
     fun priorities(): List<String> {
         val list = issues.map { it.priority?.text ?: NO_PRIO }.distinct()
         return list.filter { it != NO_PRIO } + if (NO_PRIO in list) listOf(NO_PRIO) else emptyList()

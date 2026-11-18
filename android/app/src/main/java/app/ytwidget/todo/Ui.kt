@@ -615,7 +615,8 @@ private fun DayList(vm: MainViewModel, list: List<Issue>) {
         }
     }
 
-    fun handleFor(id: String): Modifier? = if (vm.filtersActive) null else Modifier.pointerInput(id, byGroup, vm.planGroups) {
+    val canDrag = vm.canReorder()
+    fun handleFor(id: String): Modifier? = if (!canDrag) null else Modifier.pointerInput(id, byGroup, vm.planGroups) {
         detectDragGestures(
             onDragStart = { dragId = id; dragDy = 0f; target = null },
             onDrag = { change, amount ->
@@ -649,6 +650,13 @@ private fun DayList(vm: MainViewModel, list: List<Issue>) {
         .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)))
 
     LazyColumn(state = state, contentPadding = PaddingValues(vertical = 6.dp), modifier = Modifier.fillMaxSize()) {
+        if (!canDrag) {
+            item(key = "hint") {
+                Text("Часть задач плана скрыта поиском или фильтром — сбросьте их, чтобы перетаскивать и менять порядок",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 4.dp))
+            }
+        }
         vm.planGroups.forEachIndexed { gi, g ->
             val cards = byGroup[g.id].orEmpty()
             if (heads) {
@@ -669,7 +677,7 @@ private fun DayList(vm: MainViewModel, list: List<Issue>) {
                                 if (hot) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
                                 RoundedCornerShape(6.dp)),
                             contentAlignment = Alignment.Center) {
-                            Text(if (vm.filtersActive) "Нет задач" else "Перетащите задачу сюда",
+                            Text(if (!canDrag) "Нет задач" else "Перетащите задачу сюда",
                                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
@@ -774,8 +782,8 @@ private fun IssueCard(vm: MainViewModel, issue: Issue, handle: Modifier? = null)
                         Icon(if (done) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
                             if (done) "Не сделано" else "Сделано", tint = if (done) Color(0xFF43A047) else MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    IconButton(onClick = { vm.move(issue, -1) }, enabled = !vm.filtersActive && vm.canMove(issue, -1)) { Icon(Icons.Rounded.KeyboardArrowUp, "Выше") }
-                    IconButton(onClick = { vm.move(issue, 1) }, enabled = !vm.filtersActive && vm.canMove(issue, 1)) { Icon(Icons.Rounded.KeyboardArrowDown, "Ниже") }
+                    IconButton(onClick = { vm.move(issue, -1) }, enabled = handle != null && vm.canMove(issue, -1)) { Icon(Icons.Rounded.KeyboardArrowUp, "Выше") }
+                    IconButton(onClick = { vm.move(issue, 1) }, enabled = handle != null && vm.canMove(issue, 1)) { Icon(Icons.Rounded.KeyboardArrowDown, "Ниже") }
                     if (handle != null) {  // ручка для перетаскивания между блоками
                         Box(handle.size(48.dp), contentAlignment = Alignment.Center) {
                             Icon(Icons.Rounded.DragIndicator, "Перетащить", tint = MaterialTheme.colorScheme.onSurfaceVariant)
